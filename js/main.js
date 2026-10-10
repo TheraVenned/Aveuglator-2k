@@ -1,23 +1,23 @@
-// Aveuglator 2000 : caméra → profondeur (MiDaS) → analyse des zones → sons et
-// vibrations, avec un mode diagnostic. Tout s'exécute dans le navigateur, sans serveur.
+// Aveuglator 2000 : caméra → profondeur (MiDaS) → analyse des zones → sons, voix et vibrations.
+// Tout s'exécute dans le navigateur, sans serveur. Ce module orchestre les autres et gère l'écran.
 
 import { ObstacleAnalyzer, BANDS, SECTORS, Level, zoneIndex, zoneRect, alertMessage } from './analyzer.js';
-import { DepthEstimator, MODEL_SIZE } from './depth.js';
-import { renderHeatmap } from './heatmap.js';
-import { FeedbackEngine } from './feedback.js';
+import { MODEL_SIZE } from './depth.js';
+import { renderDepth } from './heatmap.js';
+import { FeedbackEngine, PHRASES } from './feedback.js';
+import { Camera, CANCELLED } from './camera.js';
+import { EngineError, enginePlan, createEngine } from './inference.js';
 
-const MODEL_URL = new URL('../models/midas_small_256.onnx', import.meta.url).href;
-const ORT_BASE = new URL('../vendor/ort/', import.meta.url).href;
 const SERVICE_WORKER_URL = new URL('../sw.js', import.meta.url).href;
+const VOICE_INDEX_URL = new URL('../audio/voice.json', import.meta.url).href;
+const VOICE_AUDIO_URL = new URL('../audio/voice.wav', import.meta.url).href;
 
-const SETTINGS_KEY = 'aveuglator.settings.v1';
+const SETTINGS_KEY = 'aveuglator.settings.v2';
 const RELOAD_FLAG = 'aveuglator.isolation-reload';
 const SINGLE_THREAD_FLAG = 'aveuglator.single-thread';
-/** Au-delà, l'initialisation du moteur d'inférence est considérée comme bloquée. */
-const ENGINE_TIMEOUT_MS = 30000;
 const DEFAULT_SETTINGS = {
-  diagnostic: true,
-  opacity: 0.55,
+  hud: true,
+  palette: 'shadow',
   sound: true,
   voice: true,
   vibration: true,
@@ -28,29 +28,33 @@ const DEFAULT_SETTINGS = {
   webgpu: false,
 };
 
-const STALL_TIMEOUT_MS = 2500;
 const LOW_FRAME_RATE = 4;
-const FAILURE_LIMIT = 15;
-const BAND_SYMBOLS = ['↑', '●', '↓'];
-
-/** Levée quand un démarrage est rendu caduc par un arrêt ou un nouveau démarrage. */
-const CANCELLED = Symbol('cancelled');
+/** Erreurs d'inférence consécutives tolérées avant de changer de moteur. */
+const FAILURE_LIMIT = 8;
+/** Durée d'un problème de caméra avant de rouvrir le flux, puis avant de prévenir l'utilisateur. */
+const CAMERA_RESTART_AFTER_MS = 1200;
+const CAMERA_ALERT_AFTER_MS = 3000;
+const CAMERA_RESTART_INTERVAL_MS = 2500;
+const CAMERA_RESTART_LIMIT = 4;
+const BAND_NAMES = ['Tête', 'Corps', 'Sol'];
+const STATUS_LABELS = { stopped: 'Arrêt', starting: 'Démarrage', running: 'Actif', failed: 'Erreur' };
 
 const byId = (id) => document.getElementById(id);
 const elements = {
   stage: byId('stage'),
+  viewport: byId('viewport'),
   video: byId('camera'),
-  overlay: byId('overlay'),
-  heatmap: byId('heatmap'),
+  depth: byId('depth'),
   grid: byId('grid'),
-  status: byId('status'),
+  idle: byId('idle'),
+  statusText: byId('status-text'),
   warning: byId('warning'),
-  diagnostics: byId('diagnostics'),
+  readout: byId('readout'),
+  matrix: byId('matrix'),
   alert: byId('alert'),
-  sectors: byId('sectors'),
-  bandSymbol: byId('band-symbol'),
+  systemLine: byId('system-line'),
   toggle: byId('toggle'),
-  diagnosticToggle: byId('diagnostic-toggle'),
+  hudToggle: byId('hud-toggle'),
   settingsOpen: byId('settings-open'),
   settings: byId('settings'),
   vibrationNote: byId('vibration-note'),
@@ -58,16 +62,21 @@ const elements = {
   inference: byId('d-inference'),
   total: byId('d-total'),
   raw: byId('d-raw'),
-  backend: byId('d-backend'),
-  vibration: byId('d-vibration'),
+  cameraInfo: byId('d-camera'),
+  spark: byId('spark'),
 };
+
+const IDLE_TEXT = elements.idle.textContent;
 
 const settings = loadSettings();
 const analyzer = new ObstacleAnalyzer();
 const feedback = new FeedbackEngine();
-const heatmapContext = elements.heatmap.getContext('2d');
-const heatmapImage = heatmapContext.createImageData(MODEL_SIZE, MODEL_SIZE);
+const camera = new Camera(elements.video, MODEL_SIZE);
+const depthContext = elements.depth.getContext('2d');
+const depthImage = depthContext.createImageData(MODEL_SIZE, MODEL_SIZE);
+const sparkContext = elements.spark.getContext('2d');
 const zoneCells = buildGrid();
+const matrixCells = buildMatrix();
 
 const state = {
   phase: 'stopped', // 'stopped' | 'starting' | 'running' | 'failed'
@@ -75,19 +84,27 @@ const state = {
   shouldRun: false,
   // Incrémenté à chaque démarrage ou arrêt : invalide les boucles et chargements en cours.
   run: 0,
-  stream: null,
-  estimator: null,
-  estimatorPromise: null,
-  backendLabel: 'non chargé',
+  // Moteur d'inférence en service, et plan de repli dont il est issu (voir inference.js).
+  engine: null,
+  enginePromise: null,
+  plan: [],
+  planIndex: 0,
+  engineNote: '',
   wakeLock: null,
-  lastFrameAt: 0,
+  // Mesures.
   frameTimes: [],
+  rateHistory: [],
   inferenceAverage: 0,
   totalAverage: 0,
   lowRateSince: null,
   lowRate: false,
+  lastTelemetryAt: 0,
+  // Surveillance de la caméra.
+  cameraIssueSince: null,
+  cameraRestarts: 0,
+  lastRestartAt: 0,
+  restartingCamera: false,
   stalled: false,
-  lastDiagnosticsAt: 0,
   shownAlert: undefined,
 };
 
@@ -107,6 +124,26 @@ function saveSettings() {
   } catch {
     // Stockage indisponible (navigation privée) : les réglages valent pour la session.
   }
+}
+
+function readFlag(key) {
+  try {
+    return localStorage.getItem(key) !== null;
+  } catch {
+    return false;
+  }
+}
+
+function writeFlag(key) {
+  try {
+    localStorage.setItem(key, '1');
+  } catch {
+    // Stockage indisponible : le repli sera simplement retenté au prochain lancement.
+  }
+}
+
+function settingInput(key) {
+  return elements.settings.querySelector(`[data-setting="${key}"]`);
 }
 
 function bindSettingsForm() {
@@ -146,26 +183,23 @@ function settingChanged(key) {
   if (key === 'cameraId' && isActive()) {
     restartCamera();
   } else if (key === 'webgpu') {
-    // Un seul moteur d'inférence par page : on recharge pour repartir proprement.
+    // Le moteur d'inférence se choisit au chargement : on recharge pour repartir proprement.
     location.reload();
   }
 }
 
 function applySettings() {
-  document.body.classList.toggle('diagnostic', settings.diagnostic);
-  elements.diagnostics.hidden = !settings.diagnostic;
-  elements.diagnosticToggle.textContent = settings.diagnostic ? 'Diagnostic activé' : 'Diagnostic désactivé';
-  elements.diagnosticToggle.setAttribute('aria-pressed', String(settings.diagnostic));
-  elements.heatmap.style.opacity = String(settings.opacity);
-  elements.sectors.hidden = !(settings.diagnostic && state.phase === 'running');
+  document.body.classList.toggle('hud', settings.hud);
+  elements.hudToggle.textContent = settings.hud ? 'Mesures affichées' : 'Mesures masquées';
+  elements.hudToggle.setAttribute('aria-pressed', String(settings.hud));
+  const hudInput = settingInput('hud');
+  if (hudInput) hudInput.checked = settings.hud;
   feedback.configure({
     sound: settings.sound,
     voice: settings.voice,
     vibration: settings.vibration,
     volume: settings.volume,
   });
-  const diagnosticInput = elements.settings.querySelector('[data-setting="diagnostic"]');
-  if (diagnosticInput) diagnosticInput.checked = settings.diagnostic;
 }
 
 // --- État et affichage ---------------------------------------------------------------------------
@@ -174,30 +208,41 @@ function isActive() {
   return state.phase === 'starting' || state.phase === 'running';
 }
 
-function setPhase(phase, statusText) {
+function setPhase(phase) {
   state.phase = phase;
-  for (const name of ['stopped', 'starting', 'running', 'failed']) {
+  for (const name of Object.keys(STATUS_LABELS)) {
     document.body.classList.toggle(name, name === phase);
   }
-  elements.status.textContent = statusText;
+  elements.statusText.textContent = STATUS_LABELS[phase];
   elements.toggle.textContent = isActive() ? 'Arrêter la détection' : 'Démarrer la détection';
-  elements.alert.hidden = phase !== 'running';
-  elements.sectors.hidden = !(settings.diagnostic && phase === 'running');
   refreshWarning();
 }
 
-function setStartupStatus(run, text) {
-  if (run === state.run && state.phase === 'starting') elements.status.textContent = text;
+/** Texte affiché à la place de la vision tant que la détection ne tourne pas. */
+function setIdle(text) {
+  elements.idle.textContent = text;
 }
 
-function refreshWarning() {
-  let text = '';
+function setStartupStatus(run, text) {
+  if (run === state.run && state.phase === 'starting') setIdle(text);
+}
+
+function refreshWarning(errorText = '') {
+  let text = errorText;
   if (state.phase === 'running') {
     if (state.stalled) text = 'Aucune image reçue : la détection est suspendue.';
     else if (state.lowRate) text = "Cadence d'analyse faible : réactivité dégradée.";
+    else if (state.engineNote) text = state.engineNote;
   }
   elements.warning.textContent = text;
   elements.warning.hidden = text === '';
+}
+
+function refreshSystemLine() {
+  const engine = state.engine ? state.engine.label : 'moteur non chargé';
+  const vibration = feedback.canVibrate ? 'vibration prête' : 'vibration indisponible';
+  const voice = feedback.hasVoice ? 'voix prête' : 'voix non chargée';
+  elements.systemLine.textContent = `${engine} · ${vibration} · ${voice}`;
 }
 
 function buildGrid() {
@@ -207,7 +252,6 @@ function buildGrid() {
       const rect = zoneRect(analyzer.config, band, sector);
       const cell = document.createElement('div');
       cell.className = 'zone';
-      cell.dataset.sector = String(sector);
       cell.style.left = `${rect.x * 100}%`;
       cell.style.top = `${rect.y * 100}%`;
       cell.style.width = `${rect.width * 100}%`;
@@ -217,21 +261,46 @@ function buildGrid() {
       elements.grid.appendChild(cell);
       cells[zoneIndex(band, sector)] = { cell, label };
     }
+    // Nom de la bande, le long du bord gauche.
+    const rows = zoneRect(analyzer.config, band, SECTORS[0]);
+    const tag = document.createElement('em');
+    tag.className = 'band-tag';
+    tag.textContent = BAND_NAMES[band];
+    tag.style.top = `${(rows.y + rows.height / 2) * 100}%`;
+    elements.grid.appendChild(tag);
   }
   return cells;
 }
 
-/** Cale les superpositions sur l'image vidéo telle qu'elle est recadrée par `object-fit: cover`. */
-function layoutOverlay() {
-  const { video, stage, overlay } = elements;
-  if (!video.videoWidth || !video.videoHeight) return;
-  const scale = Math.max(stage.clientWidth / video.videoWidth, stage.clientHeight / video.videoHeight);
-  const width = video.videoWidth * scale;
-  const height = video.videoHeight * scale;
-  overlay.style.width = `${width}px`;
-  overlay.style.height = `${height}px`;
-  overlay.style.left = `${(stage.clientWidth - width) / 2}px`;
-  overlay.style.top = `${(stage.clientHeight - height) / 2}px`;
+function buildMatrix() {
+  const cells = [];
+  for (let index = 0; index < BANDS.length * SECTORS.length; index++) {
+    const cell = document.createElement('i');
+    cell.className = 'cell';
+    elements.matrix.appendChild(cell);
+    cells.push(cell);
+  }
+  return cells;
+}
+
+/**
+ * Donne à la vision les proportions de l'image analysée, à la plus grande taille qui tienne :
+ * tout le champ de la caméra est visible, y compris les secteurs latéraux.
+ */
+function layoutViewport() {
+  const { stage, viewport, video } = elements;
+  const maxWidth = stage.clientWidth;
+  const maxHeight = stage.clientHeight;
+  if (!maxWidth || !maxHeight) return;
+  const aspect = video.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : 3 / 4;
+  let width = maxWidth;
+  let height = width / aspect;
+  if (height > maxHeight) {
+    height = maxHeight;
+    width = height * aspect;
+  }
+  viewport.style.width = `${Math.floor(width)}px`;
+  viewport.style.height = `${Math.floor(height)}px`;
 }
 
 function showAlert(alert) {
@@ -239,60 +308,106 @@ function showAlert(alert) {
   if (key === state.shownAlert) return;
   state.shownAlert = key;
   elements.alert.textContent = alert ? alertMessage(alert) : 'Voie dégagée';
-  elements.alert.dataset.level = String(alert ? alert.level : Level.NONE);
-  elements.bandSymbol.textContent = alert ? BAND_SYMBOLS[alert.band] : '✓';
-  for (const sectorElement of elements.sectors.querySelectorAll('.sector')) {
-    const isActiveSector = alert !== null && Number(sectorElement.dataset.sector) === alert.sector;
-    sectorElement.classList.toggle('active', isActiveSector);
-    sectorElement.dataset.level = String(isActiveSector ? alert.level : Level.NONE);
-  }
+  const level = String(alert ? alert.level : Level.NONE);
+  elements.readout.dataset.level = level;
+  elements.viewport.dataset.level = level;
 }
 
-/** Fait clignoter le secteur à chaque motif réellement joué. */
-function flashSector(alert) {
-  const sectorElement = elements.sectors.querySelector(`.sector[data-sector="${alert.sector}"]`);
-  if (!sectorElement) return;
-  sectorElement.classList.add('flash');
-  setTimeout(() => sectorElement.classList.remove('flash'), 120);
+/**
+ * Annonce d'état (démarrage, arrêt, panne). Attend au besoin la fin du chargement des annonces :
+ * une panne survenue dès le démarrage doit tout de même être dite.
+ */
+function announce(phrase, force = false) {
+  feedback.loadVoice(VOICE_INDEX_URL, VOICE_AUDIO_URL).then(() => {
+    refreshSystemLine();
+    feedback.speak(phrase, { urgent: true, force });
+  });
+}
+
+/** Fait réagir la matrice à chaque motif réellement joué (son ou vibration). */
+function pulseMatrix(alert) {
+  const cell = matrixCells[zoneIndex(alert.band, alert.sector)];
+  cell.classList.add('pulse');
+  setTimeout(() => cell.classList.remove('pulse'), 110);
 }
 
 function render(depth, result, now) {
+  renderDepth(depth.values, depthImage.data, settings.palette);
+  depthContext.putImageData(depthImage, 0, 0);
+
   showAlert(result.primaryAlert);
-  if (!settings.diagnostic) return;
-
-  renderHeatmap(depth.values, heatmapImage.data);
-  heatmapContext.putImageData(heatmapImage, 0, 0);
-
   const primary = result.primaryAlert;
   for (const band of BANDS) {
     for (const sector of SECTORS) {
       const index = zoneIndex(band, sector);
       const reading = result.zones[index];
-      const { cell, label } = zoneCells[index];
-      cell.dataset.level = String(reading.level);
-      cell.classList.toggle('primary', primary !== null && primary.band === band && primary.sector === sector);
-      label.textContent = reading.score.toFixed(2);
+      const isPrimary = primary !== null && primary.band === band && primary.sector === sector;
+      const level = String(reading.level);
+      matrixCells[index].dataset.level = level;
+      matrixCells[index].classList.toggle('is-primary', isPrimary);
+      if (settings.hud) {
+        const { cell, label } = zoneCells[index];
+        cell.dataset.level = level;
+        cell.classList.toggle('is-primary', isPrimary);
+        label.textContent = reading.score.toFixed(2);
+      }
     }
   }
 
   // Les chiffres sont rafraîchis quatre fois par seconde pour rester lisibles.
-  if (now - state.lastDiagnosticsAt < 250) return;
-  state.lastDiagnosticsAt = now;
-  elements.fps.textContent = currentFrameRate(now).toFixed(1);
-  elements.inference.textContent = `${state.inferenceAverage.toFixed(1)} ms`;
-  elements.total.textContent = `${state.totalAverage.toFixed(1)} ms`;
-  elements.raw.textContent = `${depth.rawMin.toFixed(0)} à ${depth.rawMax.toFixed(0)}`;
+  if (!settings.hud || now - state.lastTelemetryAt < 250) return;
+  state.lastTelemetryAt = now;
+  const rate = currentFrameRate(now);
+  elements.fps.textContent = rate.toFixed(1);
+  elements.inference.textContent = state.inferenceAverage.toFixed(0);
+  elements.total.textContent = state.totalAverage.toFixed(0);
+  elements.raw.textContent = `${depth.rawMin.toFixed(0)}–${depth.rawMax.toFixed(0)}`;
+  const restarts = state.cameraRestarts > 0 ? ` · relances ${state.cameraRestarts}` : '';
+  elements.cameraInfo.textContent = `${camera.description}${restarts}`;
+  drawSparkline(rate);
+}
+
+/** Courbe des dernières cadences mesurées (une quinzaine de secondes). */
+function drawSparkline(rate) {
+  const history = state.rateHistory;
+  history.push(rate);
+  if (history.length > 60) history.shift();
+  const { width, height } = elements.spark;
+  const top = Math.max(10, ...history);
+  sparkContext.clearRect(0, 0, width, height);
+  sparkContext.beginPath();
+  history.forEach((value, index) => {
+    const x = (index / 59) * width;
+    const y = height - 2 - (value / top) * (height - 4);
+    if (index === 0) sparkContext.moveTo(x, y);
+    else sparkContext.lineTo(x, y);
+  });
+  sparkContext.strokeStyle = '#ffc400';
+  sparkContext.lineWidth = 3;
+  sparkContext.lineJoin = 'round';
+  sparkContext.stroke();
+}
+
+/** Vision opaque et noire : la vidéo de la caméra, placée dessous, ne doit jamais apparaître. */
+function blankDepth() {
+  depthContext.fillStyle = '#0a0d14';
+  depthContext.fillRect(0, 0, MODEL_SIZE, MODEL_SIZE);
 }
 
 function clearDisplay() {
-  heatmapContext.clearRect(0, 0, MODEL_SIZE, MODEL_SIZE);
+  blankDepth();
   for (const { cell, label } of zoneCells) {
     cell.dataset.level = '0';
-    cell.classList.remove('primary');
+    cell.classList.remove('is-primary');
     label.textContent = '';
   }
+  for (const cell of matrixCells) {
+    cell.dataset.level = '0';
+    cell.classList.remove('is-primary');
+  }
   state.shownAlert = undefined;
-  showAlert(null);
+  elements.readout.dataset.level = '0';
+  elements.viewport.dataset.level = '0';
 }
 
 // --- Mesures -------------------------------------------------------------------------------------
@@ -304,12 +419,10 @@ function currentFrameRate(now) {
   return ((times.length - 1) * 1000) / (now - times[0]);
 }
 
-function recordFrame(started, finished) {
-  state.lastFrameAt = finished;
+function recordFrame(started, finished, inferenceMs) {
   state.frameTimes.push(finished);
-  const inference = state.estimator.lastInferenceMs;
   const total = finished - started;
-  state.inferenceAverage = state.inferenceAverage === 0 ? inference : state.inferenceAverage * 0.9 + inference * 0.1;
+  state.inferenceAverage = state.inferenceAverage === 0 ? inferenceMs : state.inferenceAverage * 0.9 + inferenceMs * 0.1;
   state.totalAverage = state.totalAverage === 0 ? total : state.totalAverage * 0.9 + total * 0.1;
 
   // Chute de cadence : signalée seulement si elle dure plus de trois secondes.
@@ -323,288 +436,212 @@ function recordFrame(started, finished) {
   if (lowRate !== state.lowRate) {
     state.lowRate = lowRate;
     refreshWarning();
-    if (lowRate) feedback.speak('Performances dégradées, la détection est ralentie.', { urgent: true, force: true });
+    if (lowRate) announce(PHRASES.slow, true);
   }
 }
 
 function resetMeasures() {
   state.frameTimes = [];
+  state.rateHistory = [];
   state.inferenceAverage = 0;
   state.totalAverage = 0;
   state.lowRateSince = null;
   state.lowRate = false;
+  state.lastTelemetryAt = 0;
+  state.cameraIssueSince = null;
+  state.cameraRestarts = 0;
+  state.lastRestartAt = 0;
   state.stalled = false;
-  state.lastDiagnosticsAt = 0;
-  state.lastFrameAt = performance.now();
-}
-
-/**
- * Vérifie chaque seconde que des images sont bien analysées : une personne qui ne voit pas
- * l'écran doit être prévenue quand la détection n'est plus assurée.
- */
-function watchFrameFlow() {
-  if (state.phase !== 'running') return;
-  const silent = performance.now() - state.lastFrameAt > STALL_TIMEOUT_MS;
-  if (silent && !state.stalled) {
-    state.stalled = true;
-    feedback.update(null);
-    feedback.notify('fault');
-    feedback.speak("Attention, la caméra ne fournit plus d'images. Détection suspendue.", { urgent: true, force: true });
-    refreshWarning();
-  } else if (!silent && state.stalled) {
-    state.stalled = false;
-    feedback.speak('Détection rétablie.', { urgent: true, force: true });
-    refreshWarning();
-  }
 }
 
 // --- Caméra --------------------------------------------------------------------------------------
 
-async function startCamera(run) {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    throw new Error('Caméra inaccessible : ouvrez le site en HTTPS dans Safari ou Chrome.');
-  }
-  stopCamera();
+/**
+ * Surveille le flux deux fois par seconde. Un navigateur mobile peut mettre la vidéo en pause ou
+ * figer le flux sans prévenir : on relance alors la lecture, puis on rouvre la caméra. La personne
+ * n'est avertie que si cela ne suffit pas, car elle ne voit pas l'écran.
+ */
+async function superviseCamera() {
+  if (state.phase !== 'running' || state.restartingCamera) return;
+  camera.probe();
+  const now = performance.now();
+  const health = camera.health(now);
 
-  const video = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
-  if (settings.cameraId) video.deviceId = { exact: settings.cameraId };
-  else video.facingMode = { ideal: 'environment' };
-
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
-  } catch (error) {
-    if (settings.cameraId && (error.name === 'OverconstrainedError' || error.name === 'NotFoundError')) {
-      // La caméra mémorisée n'existe plus : retour au choix automatique.
-      settings.cameraId = '';
-      saveSettings();
-      return startCamera(run);
+  if (health === 'ok') {
+    state.cameraIssueSince = null;
+    if (state.stalled) {
+      state.stalled = false;
+      announce(PHRASES.restored, true);
+      refreshWarning();
     }
-    throw error;
-  }
-  if (run !== state.run) {
-    for (const track of stream.getTracks()) track.stop();
-    throw CANCELLED;
+    return;
   }
 
-  // Un autre démarrage a pu aboutir entre-temps (changement de caméra) : on libère son flux.
-  stopCamera();
-  state.stream = stream;
-  for (const track of stream.getVideoTracks()) {
-    track.addEventListener('ended', () => {
-      if (state.stream === stream && isActive()) fail("La caméra s'est arrêtée.");
-    });
+  if (state.cameraIssueSince === null) state.cameraIssueSince = now;
+  const elapsed = now - state.cameraIssueSince;
+  if (health === 'paused') camera.resume();
+
+  if (elapsed >= CAMERA_ALERT_AFTER_MS && !state.stalled) {
+    state.stalled = true;
+    feedback.update(null);
+    feedback.notify('fault');
+    announce(PHRASES.stalled, true);
+    refreshWarning();
   }
-  elements.video.srcObject = stream;
-  await elements.video.play();
-  layoutOverlay();
-  refreshCameraList();
+
+  const shouldRestart = health === 'ended' || elapsed >= CAMERA_RESTART_AFTER_MS;
+  if (shouldRestart && now - state.lastRestartAt >= CAMERA_RESTART_INTERVAL_MS) {
+    if (state.cameraRestarts >= CAMERA_RESTART_LIMIT) {
+      fail('la caméra ne répond plus.');
+      return;
+    }
+    state.cameraRestarts += 1;
+    await restartCamera();
+  }
 }
 
-function stopCamera() {
-  if (state.stream) {
-    for (const track of state.stream.getTracks()) track.stop();
-  }
-  state.stream = null;
-  elements.video.srcObject = null;
-}
-
+/** Rouvre la caméra : après une panne du flux, ou quand l'utilisateur en choisit une autre. */
 async function restartCamera() {
   const run = state.run;
+  state.restartingCamera = true;
+  state.lastRestartAt = performance.now();
   try {
-    await startCamera(run);
+    await camera.start(settings.cameraId, () => run !== state.run);
+    layoutViewport();
+    refreshCameraList();
   } catch (error) {
-    if (error !== CANCELLED && run === state.run) fail(describeError(error));
+    // Nouvelle tentative au prochain passage de la surveillance, dans la limite prévue.
+    if (error !== CANCELLED) console.warn('Réouverture de la caméra impossible.', error);
+  } finally {
+    state.restartingCamera = false;
   }
 }
 
 /** Les noms des caméras ne sont lisibles qu'une fois l'autorisation accordée. */
 async function refreshCameraList() {
-  const select = elements.settings.querySelector('[data-setting="cameraId"]');
+  const select = settingInput('cameraId');
   if (!select || !navigator.mediaDevices.enumerateDevices) return;
   try {
     const devices = await navigator.mediaDevices.enumerateDevices();
     const cameras = devices.filter((device) => device.kind === 'videoinput' && device.deviceId);
-    select.replaceChildren(new Option('Automatique', ''));
-    cameras.forEach((camera, index) => {
-      select.appendChild(new Option(camera.label || `Caméra ${index + 1}`, camera.deviceId));
+    select.replaceChildren(new Option('Angle le plus large', ''));
+    cameras.forEach((device, index) => {
+      select.appendChild(new Option(device.label || `Caméra ${index + 1}`, device.deviceId));
     });
-    select.value = cameras.some((camera) => camera.deviceId === settings.cameraId) ? settings.cameraId : '';
+    select.value = cameras.some((device) => device.deviceId === settings.cameraId) ? settings.cameraId : '';
   } catch {
     // Liste indisponible : le choix automatique reste proposé.
   }
 }
 
-// --- Modèle --------------------------------------------------------------------------------------
+// --- Moteur d'inférence --------------------------------------------------------------------------
 
-function ensureEstimator(run) {
-  if (!state.estimatorPromise) {
-    state.estimatorPromise = createEstimator(run).catch((error) => {
-      state.estimatorPromise = null;
-      throw error;
+function ensureEngine(run) {
+  if (state.engine) return Promise.resolve(state.engine);
+  if (!state.enginePromise) {
+    state.plan = enginePlan({
+      webgpu: settings.webgpu && 'gpu' in navigator,
+      multiThread: self.crossOriginIsolated && !readFlag(SINGLE_THREAD_FLAG),
+      cores: navigator.hardwareConcurrency,
+    });
+    state.enginePromise = startEngine(0, run).finally(() => {
+      state.enginePromise = null;
     });
   }
-  return state.estimatorPromise;
+  return state.enginePromise;
 }
 
-async function createEstimator(run) {
-  const bytes = await downloadModel((fraction) => {
-    setStartupStatus(run, `Téléchargement du modèle… ${Math.round(fraction * 100)} %`);
-  });
-  setStartupStatus(run, 'Préparation du modèle…');
-
-  if (settings.webgpu && 'gpu' in navigator) {
+/** Initialise le premier moteur du plan qui fonctionne, à partir de `fromIndex`. */
+async function startEngine(fromIndex, run) {
+  let lastError = new Error('aucun moteur de calcul disponible.');
+  for (let index = fromIndex; index < state.plan.length; index++) {
+    const step = state.plan[index];
+    const engine = createEngine(step);
     try {
-      return await withTimeout(createEstimatorWith('webgpu', bytes, 1, ''), ENGINE_TIMEOUT_MS);
+      await engine.init((stage, fraction) => {
+        const text = stage === 'download'
+          ? `Téléchargement du modèle… ${Math.round(fraction * 100)} %`
+          : `Préparation du modèle (${engine.label})…`;
+        setStartupStatus(run, text);
+      });
+      state.engine = engine;
+      state.planIndex = index;
+      refreshSystemLine();
+      return engine;
     } catch (error) {
-      console.warn('WebGPU indisponible, retour au moteur standard.', error);
-      settings.webgpu = false;
-      saveSettings();
-      const input = elements.settings.querySelector('[data-setting="webgpu"]');
-      if (input) input.checked = false;
+      console.warn(`Moteur ${engine.label} indisponible.`, error);
+      engine.dispose();
+      rememberEngineFailure(step);
+      lastError = error;
     }
   }
+  throw lastError;
+}
 
-  const threads = preferredThreadCount();
-  if (threads === 1) return createEstimatorWith('wasm', bytes, 1, '');
-  try {
-    return await withTimeout(createEstimatorWith('wasm', bytes, threads, ''), ENGINE_TIMEOUT_MS);
-  } catch (error) {
-    // Un moteur dont l'initialisation a échoué ne peut pas être relancé : on en importe une
-    // copie neuve (adresse différente) et on calcule sur un seul fil, y compris les fois suivantes.
-    console.warn('Calcul multi-fil indisponible, retour à un seul fil.', error);
+/** Évite de retenter à chaque lancement un moteur qui ne fonctionne pas sur cet appareil. */
+function rememberEngineFailure(step) {
+  if (step.backend === 'webgpu') {
+    settings.webgpu = false;
+    saveSettings();
+    const input = settingInput('webgpu');
+    if (input) input.checked = false;
+  } else if (step.kind === 'worker' && step.threads > 1) {
     writeFlag(SINGLE_THREAD_FLAG);
-    setStartupStatus(run, 'Préparation du modèle (mode compatible)…');
-    return createEstimatorWith('wasm', bytes, 1, '?single-thread');
   }
 }
 
-/** Le calcul multi-fil exige une page « cross-origin isolated » (voir sw.js). */
-function preferredThreadCount() {
-  if (!self.crossOriginIsolated || readFlag(SINGLE_THREAD_FLAG)) return 1;
-  return Math.min(4, navigator.hardwareConcurrency || 2);
-}
-
-function readFlag(key) {
+/** Remplace un moteur bloqué ou en panne par le suivant du plan. Renvoie `false` s'il n'en reste pas. */
+async function replaceEngine(run, error) {
+  console.warn(`Moteur ${state.engine ? state.engine.label : ''} abandonné.`, error);
+  feedback.update(null);
+  rememberEngineFailure(state.plan[state.planIndex]);
+  if (state.engine) state.engine.dispose();
+  state.engine = null;
+  state.engineNote = 'Moteur de calcul relancé en mode compatible.';
+  refreshWarning();
   try {
-    return localStorage.getItem(key) !== null;
-  } catch {
+    await startEngine(state.planIndex + 1, run);
+  } catch (startError) {
+    if (run === state.run) fail(describeError(startError), startError);
     return false;
   }
-}
-
-function writeFlag(key) {
-  try {
-    localStorage.setItem(key, '1');
-  } catch {
-    // Stockage indisponible : le repli sera simplement retenté au prochain lancement.
-  }
-}
-
-function withTimeout(promise, milliseconds) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Délai dépassé.')), milliseconds);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
-
-async function createEstimatorWith(backend, bytes, threads, moduleSuffix) {
-  const moduleName = backend === 'webgpu' ? 'ort.webgpu.min.mjs' : 'ort.wasm.min.mjs';
-  const ort = await import(`${ORT_BASE}${moduleName}${moduleSuffix}`);
-  ort.env.wasm.wasmPaths = ORT_BASE;
-  ort.env.wasm.numThreads = threads;
-
-  const estimator = await DepthEstimator.create(ort, bytes, [backend]);
-  await selfTest(estimator);
-  state.backendLabel = backend === 'webgpu' ? 'WebGPU' : `WASM × ${threads}`;
-  elements.backend.textContent = state.backendLabel;
-  return estimator;
-}
-
-/** Une inférence à blanc : écarte un moteur qui renverrait une sortie vide ou constante. */
-async function selfTest(estimator) {
-  const pixels = new Uint8ClampedArray(MODEL_SIZE * MODEL_SIZE * 4);
-  for (let y = 0; y < MODEL_SIZE; y++) {
-    for (let x = 0; x < MODEL_SIZE; x++) {
-      const offset = (y * MODEL_SIZE + x) * 4;
-      const shade = x > 90 && x < 170 && y > 60 && y < 200 ? 220 : 40 + (y >> 1);
-      pixels[offset] = shade;
-      pixels[offset + 1] = shade;
-      pixels[offset + 2] = shade;
-      pixels[offset + 3] = 255;
-    }
-  }
-  const depth = await estimator.estimateFromRGBA(pixels);
-  estimator.reset();
-  if (!(depth.rawMax - depth.rawMin > 1)) {
-    throw new Error('Le moteur renvoie une carte de profondeur vide.');
-  }
-}
-
-async function downloadModel(onProgress) {
-  const response = await fetch(MODEL_URL);
-  if (!response.ok) throw new Error(`Modèle introuvable (HTTP ${response.status}).`);
-  const total = Number(response.headers.get('Content-Length')) || 0;
-  if (!response.body || total === 0) return new Uint8Array(await response.arrayBuffer());
-
-  const reader = response.body.getReader();
-  const chunks = [];
-  let received = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    received += value.length;
-    onProgress(Math.min(received / total, 0.99));
-  }
-  const bytes = new Uint8Array(received);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return bytes;
+  return run === state.run;
 }
 
 // --- Cycle de vie --------------------------------------------------------------------------------
 
 async function start() {
   if (isActive()) return;
-  // À faire tout de suite, dans le geste de l'utilisateur : déverrouille le son et la voix.
+  // À faire tout de suite, dans le geste de l'utilisateur : déverrouille le son.
   feedback.unlock();
-  feedback.speak('Démarrage de la détection.', { urgent: true });
+  // Les annonces se chargent pendant le démarrage, pour être prêtes dès la première alerte.
+  feedback.loadVoice(VOICE_INDEX_URL, VOICE_AUDIO_URL).then(refreshSystemLine);
 
   state.shouldRun = true;
   const run = ++state.run;
-  setPhase('starting', 'Démarrage de la détection…');
+  setPhase('starting');
+  setIdle('Démarrage de la détection…');
+  clearDisplay();
 
   try {
-    const [, estimator] = await Promise.all([startCamera(run), ensureEstimator(run)]);
-    if (run !== state.run) return;
-    state.estimator = estimator;
+    await Promise.all([camera.start(settings.cameraId, () => run !== state.run), ensureEngine(run)]);
   } catch (error) {
-    if (error !== CANCELLED && run === state.run) fail(describeError(error));
+    if (error !== CANCELLED && run === state.run) fail(describeError(error), error);
     return;
   }
+  if (run !== state.run) return;
 
-  state.estimator.reset();
   analyzer.reset();
   resetMeasures();
-  clearDisplay();
-  elements.backend.textContent = state.backendLabel;
-  setPhase('running', 'Détection active');
+  state.engineNote = '';
+  layoutViewport();
+  refreshCameraList();
+  refreshSystemLine();
+  setPhase('running');
+  showAlert(null);
   feedback.start();
   feedback.notify('started');
-  feedback.speak('Détection active.', { urgent: true });
+  announce(PHRASES.active);
   acquireWakeLock();
   processFrames(run);
 }
@@ -612,30 +649,36 @@ async function start() {
 /** Arrêt demandé par l'utilisateur. */
 function stop() {
   state.shouldRun = false;
-  halt('Détection arrêtée');
-  feedback.speak('Détection arrêtée.', { urgent: true });
+  halt();
+  announce(PHRASES.stopped);
 }
 
-function halt(statusText) {
+function halt() {
   state.run += 1;
-  stopCamera();
+  camera.stop();
   feedback.stop();
   releaseWakeLock();
   resetMeasures();
   clearDisplay();
-  setPhase('stopped', statusText);
+  setIdle(IDLE_TEXT);
+  setPhase('stopped');
+  elements.alert.textContent = 'Prêt';
 }
 
-function fail(message) {
+function fail(message, error = null) {
   state.run += 1;
-  stopCamera();
+  camera.stop();
   feedback.stop();
   releaseWakeLock();
   resetMeasures();
   clearDisplay();
-  setPhase('failed', `Erreur : ${message}`);
+  setIdle(IDLE_TEXT);
+  setPhase('failed');
+  elements.alert.textContent = 'Détection arrêtée';
+  refreshWarning(`Erreur : ${message}`);
   feedback.notify('fault');
-  feedback.speak(`Erreur. ${message}`, { urgent: true, force: true });
+  const denied = error !== null && (error.name === 'NotAllowedError' || error.name === 'SecurityError');
+  announce(denied ? PHRASES.cameraDenied : PHRASES.error, true);
 }
 
 function describeError(error) {
@@ -654,56 +697,55 @@ function describeError(error) {
   }
 }
 
-/** Résout à la prochaine image vidéo ; `false` si aucune image nouvelle n'est arrivée à temps. */
-function nextVideoFrame(video, lastTime) {
+/** Attend le prochain rafraîchissement de l'écran, sans jamais rester bloqué s'il tarde. */
+function nextTick() {
   return new Promise((resolve) => {
-    if (typeof video.requestVideoFrameCallback === 'function') {
-      let settled = false;
-      const settle = (fresh) => {
-        if (settled) return;
-        settled = true;
-        resolve(fresh);
-      };
-      video.requestVideoFrameCallback(() => settle(true));
-      // Garde-fou : ce rappel ne se déclenche jamais si le flux se fige.
-      setTimeout(() => settle(false), 300);
-    } else {
-      requestAnimationFrame(() => resolve(video.currentTime !== lastTime));
-    }
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    requestAnimationFrame(settle);
+    setTimeout(settle, 120);
   });
 }
 
 /** Boucle d'analyse : une image à la fois, les images arrivées entre-temps sont ignorées. */
 async function processFrames(run) {
-  const video = elements.video;
+  const isCurrent = () => run === state.run && state.phase === 'running';
   let failures = 0;
-  let lastTime = -1;
 
-  while (run === state.run && state.phase === 'running') {
-    const fresh = await nextVideoFrame(video, lastTime);
-    if (run !== state.run || state.phase !== 'running') return;
-    if (!fresh || video.readyState < 2 || video.videoWidth === 0) continue;
-    lastTime = video.currentTime;
+  while (isCurrent()) {
+    await nextTick();
+    if (!isCurrent()) return;
+    const pixels = camera.capture();
+    if (!pixels) continue;
 
     const started = performance.now();
+    let depth;
     try {
-      const depth = await state.estimator.estimate(video, settings.nearReference);
-      if (run !== state.run) return;
-      analyzer.config.sensitivity = settings.sensitivity;
-      const result = analyzer.analyze(depth.values, depth.width, depth.height);
-      feedback.update(result.primaryAlert);
-      const finished = performance.now();
-      recordFrame(started, finished);
-      render(depth, result, finished);
-      failures = 0;
+      depth = await state.engine.run(pixels, settings.nearReference);
     } catch (error) {
-      console.error(error);
+      if (!isCurrent()) return;
+      const engineDown = error instanceof EngineError && (error.kind === 'hang' || error.kind === 'crash');
       failures += 1;
-      if (failures >= FAILURE_LIMIT) {
-        if (run === state.run) fail(describeError(error));
-        return;
+      if (engineDown || failures >= FAILURE_LIMIT) {
+        failures = 0;
+        if (!(await replaceEngine(run, error))) return;
       }
+      continue;
     }
+    if (!isCurrent()) return;
+    failures = 0;
+
+    analyzer.config.sensitivity = settings.sensitivity;
+    const result = analyzer.analyze(depth.values, depth.width, depth.height);
+    // Flux figé : l'image analysée est périmée, on ne signale plus rien.
+    feedback.update(state.stalled ? null : result.primaryAlert);
+    const finished = performance.now();
+    recordFrame(started, finished, depth.inferenceMs);
+    render(depth, result, finished);
   }
 }
 
@@ -755,44 +797,52 @@ async function registerServiceWorker() {
 function init() {
   bindSettingsForm();
   applySettings();
-  setPhase('stopped', 'Détection arrêtée');
   clearDisplay();
+  setPhase('stopped');
+  refreshSystemLine();
+  layoutViewport();
 
-  const vibrationText = feedback.canVibrate
-    ? 'prise en charge'
-    : 'non prise en charge par ce navigateur';
-  elements.vibration.textContent = vibrationText;
   elements.vibrationNote.textContent = feedback.canVibrate
     ? ''
     : "Ce navigateur ne donne pas accès au moteur de vibration (c'est le cas de Safari sur iPhone) : les dangers sont signalés par le son et la voix.";
 
-  feedback.onPulse = flashSector;
+  feedback.onPulse = pulseMatrix;
 
   elements.toggle.addEventListener('click', () => {
     if (isActive()) stop();
     else start();
   });
-  elements.diagnosticToggle.addEventListener('click', () => {
-    settings.diagnostic = !settings.diagnostic;
+  elements.hudToggle.addEventListener('click', () => {
+    settings.hud = !settings.hud;
     saveSettings();
     applySettings();
   });
   elements.settingsOpen.addEventListener('click', () => elements.settings.showModal());
 
-  elements.video.addEventListener('loadedmetadata', layoutOverlay);
-  elements.video.addEventListener('resize', layoutOverlay);
-  window.addEventListener('resize', layoutOverlay);
+  // Un geste quelconque suffit à réveiller le son si le navigateur l'a suspendu.
+  document.addEventListener('pointerdown', () => {
+    if (isActive()) feedback.unlock();
+  });
+
+  elements.video.addEventListener('loadedmetadata', layoutViewport);
+  elements.video.addEventListener('resize', layoutViewport);
+  // Mise en pause par le navigateur : on relance sans attendre la surveillance périodique.
+  elements.video.addEventListener('pause', () => {
+    if (state.phase === 'running') camera.resume();
+  });
+  window.addEventListener('resize', layoutViewport);
+  if ('ResizeObserver' in window) new ResizeObserver(layoutViewport).observe(elements.stage);
 
   // Le navigateur coupe la caméra en arrière-plan : on arrête proprement, puis on reprend.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
-      if (isActive()) halt('Détection en pause');
+      if (isActive()) halt();
     } else if (state.shouldRun && !isActive()) {
       start();
     }
   });
 
-  setInterval(watchFrameFlow, 1000);
+  setInterval(superviseCamera, 500);
   registerServiceWorker();
 }
 

@@ -6,7 +6,7 @@
 // 2. Cache : le modèle et le moteur d'inférence (gros, immuables) sont servis depuis le cache ;
 //    le reste du site passe par le réseau et retombe sur le cache hors connexion.
 
-const SHELL_CACHE = 'aveuglator-shell-v1';
+const SHELL_CACHE = 'aveuglator-shell-v2';
 const ASSET_CACHE = 'aveuglator-assets-v1';
 const HEAVY_ASSET = /\/(models|vendor)\//;
 

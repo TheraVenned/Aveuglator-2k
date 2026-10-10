@@ -1,4 +1,5 @@
-// Estimation de profondeur MiDaS v2.1 Small (ONNX), exécutée dans le navigateur.
+// Estimation de profondeur MiDaS v2.1 Small (ONNX). Ce module n'utilise aucune API de page :
+// il s'exécute aussi bien dans un worker que sur le fil principal.
 
 export const MODEL_SIZE = 256;
 
@@ -20,6 +21,32 @@ export function toModelInput(rgba, size, out = new Float32Array(3 * size * size)
   return out;
 }
 
+/** Télécharge le modèle en signalant l'avancement (fraction de 0 à 1). */
+export async function downloadModel(url, onProgress = () => {}) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Modèle introuvable (HTTP ${response.status}).`);
+  const total = Number(response.headers.get('Content-Length')) || 0;
+  if (!response.body || total === 0) return new Uint8Array(await response.arrayBuffer());
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    onProgress(Math.min(received / total, 0.99));
+  }
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes;
+}
+
 /**
  * Ramène les valeurs brutes du modèle (profondeur inverse relative, élevée = proche) dans [0, 1].
  * L'étendue est lissée dans le temps pour que la carte ne « respire » pas d'une image à l'autre.
@@ -38,7 +65,7 @@ export class DepthNormalizer {
   /**
    * `nearReference` : valeur brute minimale tenue pour « très proche ». À 0, la normalisation suit
    * uniquement l'étendue de chaque image ; une valeur calibrée évite qu'une scène entièrement
-   * lointaine soit étirée jusqu'au rouge.
+   * lointaine soit étirée jusqu'au plus sombre.
    */
   normalize(raw, nearReference = 0, out = new Float32Array(raw.length)) {
     let frameLow = Infinity;
@@ -91,8 +118,6 @@ export class DepthEstimator {
     this.input = new Float32Array(3 * MODEL_SIZE * MODEL_SIZE);
     this.normalized = new Float32Array(MODEL_SIZE * MODEL_SIZE);
     this.normalizer = new DepthNormalizer();
-    this.canvas = null;
-    this.context = null;
     /** Durée de la dernière inférence seule, en millisecondes. */
     this.lastInferenceMs = 0;
   }
@@ -101,20 +126,10 @@ export class DepthEstimator {
     this.normalizer.reset();
   }
 
-  /** Estime la profondeur d'une image vidéo. L'image entière est étirée vers l'entrée carrée. */
-  async estimate(source, nearReference = 0) {
-    if (!this.context) {
-      this.canvas = document.createElement('canvas');
-      this.canvas.width = MODEL_SIZE;
-      this.canvas.height = MODEL_SIZE;
-      this.context = this.canvas.getContext('2d', { willReadFrequently: true });
-    }
-    this.context.drawImage(source, 0, 0, MODEL_SIZE, MODEL_SIZE);
-    const rgba = this.context.getImageData(0, 0, MODEL_SIZE, MODEL_SIZE).data;
-    return this.estimateFromRGBA(rgba, nearReference);
-  }
-
-  /** `rgba` : pixels d'une image de MODEL_SIZE × MODEL_SIZE. */
+  /**
+   * `rgba` : pixels d'une image de MODEL_SIZE × MODEL_SIZE. Le tableau `values` renvoyé est
+   * réutilisé d'un appel à l'autre : le copier pour le conserver.
+   */
   async estimateFromRGBA(rgba, nearReference = 0) {
     toModelInput(rgba, MODEL_SIZE, this.input);
     const tensor = new this.ort.Tensor('float32', this.input, [1, 3, MODEL_SIZE, MODEL_SIZE]);
@@ -135,6 +150,26 @@ export class DepthEstimator {
     }
     const { values, rawMin, rawMax } = this.normalizer.normalize(output.data, nearReference, this.normalized);
     return { values, width, height, rawMin, rawMax };
+  }
+
+  /** Une inférence à blanc : écarte un moteur qui renverrait une sortie vide ou constante. */
+  async selfTest() {
+    const pixels = new Uint8ClampedArray(MODEL_SIZE * MODEL_SIZE * 4);
+    for (let y = 0; y < MODEL_SIZE; y++) {
+      for (let x = 0; x < MODEL_SIZE; x++) {
+        const offset = (y * MODEL_SIZE + x) * 4;
+        const shade = x > 90 && x < 170 && y > 60 && y < 200 ? 220 : 40 + (y >> 1);
+        pixels[offset] = shade;
+        pixels[offset + 1] = shade;
+        pixels[offset + 2] = shade;
+        pixels[offset + 3] = 255;
+      }
+    }
+    const depth = await this.estimateFromRGBA(pixels);
+    this.reset();
+    if (!(depth.rawMax - depth.rawMin > 1)) {
+      throw new Error('Le moteur renvoie une carte de profondeur vide.');
+    }
   }
 
   async release() {

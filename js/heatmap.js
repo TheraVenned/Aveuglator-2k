@@ -1,9 +1,10 @@
-// Carte de profondeur en fausses couleurs : rouge = proche, bleu = loin.
+// Rendu de la carte de profondeur, telle que le modèle la « voit ».
 
-/** 256 couleurs, octets rangés R, G, B, A en mémoire (machines petit-boutistes). */
-const PALETTE = buildPalette();
-
-function buildPalette() {
+/**
+ * 256 teintes, octets rangés R, G, B, A en mémoire (machines petit-boutistes).
+ * `colorFor(proximité)` renvoie [r, g, b] sur 0-255.
+ */
+function buildPalette(colorFor) {
   const palette = new Uint32Array(256);
   for (let index = 0; index < 256; index++) {
     const [red, green, blue] = colorFor(index / 255);
@@ -12,8 +13,16 @@ function buildPalette() {
   return palette;
 }
 
-/** Dégradé bleu → cyan → vert → jaune → rouge. Renvoie [r, g, b] sur 0-255. */
-export function colorFor(proximity) {
+/** Ombres : le lointain est blanc, ce qui est proche se détache en silhouette sombre. */
+export function shadowColor(proximity) {
+  // Exposant inférieur à 1 : les plans intermédiaires s'assombrissent tôt, les silhouettes
+  // restent lisibles même loin du premier plan.
+  const shade = Math.round(246 - 222 * Math.pow(proximity, 0.8));
+  return [shade, shade, shade];
+}
+
+/** Fausses couleurs : bleu (loin) → cyan → vert → jaune → rouge (proche). */
+export function thermalColor(proximity) {
   let red;
   let green;
   let blue;
@@ -37,13 +46,22 @@ export function colorFor(proximity) {
   return [red, green, blue].map((channel) => Math.round(Math.min(Math.max(channel, 0), 1) * 255));
 }
 
-/** Écrit la carte dans `pixels` (Uint8ClampedArray RGBA de même taille, par exemple ImageData.data). */
-export function renderHeatmap(values, pixels) {
+const PALETTES = {
+  shadow: buildPalette(shadowColor),
+  thermal: buildPalette(thermalColor),
+};
+
+/**
+ * Écrit la carte dans `pixels` (Uint8ClampedArray RGBA de même taille, par exemple ImageData.data).
+ * `style` : 'shadow' (par défaut) ou 'thermal'.
+ */
+export function renderDepth(values, pixels, style = 'shadow') {
+  const palette = PALETTES[style] || PALETTES.shadow;
   const target = new Uint32Array(pixels.buffer, pixels.byteOffset, values.length);
   for (let index = 0; index < values.length; index++) {
     const value = values[index];
     // Robuste aux NaN : toutes les comparaisons échouent et donnent l'indice 0.
     const level = value > 0 ? (value < 1 ? Math.floor(value * 255) : 255) : 0;
-    target[index] = PALETTE[level];
+    target[index] = palette[level];
   }
 }

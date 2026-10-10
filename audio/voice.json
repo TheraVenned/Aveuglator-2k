@@ -1,0 +1,106 @@
+{
+  "voice": "Microsoft Hortense Desktop",
+  "sampleRate": 22050,
+  "clips": {
+    "Détection active.": [
+      0.2,
+      1.2634
+    ],
+    "Détection arrêtée.": [
+      1.6634,
+      1.2402
+    ],
+    "Attention, la caméra ne fournit plus d'images. Détection suspendue.": [
+      3.1037,
+      4.2463
+    ],
+    "Détection rétablie.": [
+      7.5499,
+      1.1346
+    ],
+    "Performances dégradées, la détection est ralentie.": [
+      8.8846,
+      2.4551
+    ],
+    "Erreur. La détection est arrêtée.": [
+      11.5397,
+      2.622
+    ],
+    "Accès à la caméra refusé.": [
+      14.3617,
+      1.4453
+    ],
+    "Obstacle en hauteur proche à gauche": [
+      16.007,
+      1.6917
+    ],
+    "Obstacle en hauteur proche au centre": [
+      17.8987,
+      1.8018
+    ],
+    "Obstacle en hauteur proche à droite": [
+      19.9005,
+      1.7721
+    ],
+    "Obstacle proche à gauche": [
+      21.8726,
+      1.287
+    ],
+    "Obstacle proche au centre": [
+      23.3596,
+      1.4007
+    ],
+    "Obstacle proche à droite": [
+      24.9603,
+      1.3761
+    ],
+    "Dénivelé proche à gauche": [
+      26.5364,
+      1.2225
+    ],
+    "Dénivelé proche au centre": [
+      27.959,
+      1.3287
+    ],
+    "Dénivelé proche à droite": [
+      29.4876,
+      1.3121
+    ],
+    "Obstacle en hauteur très proche à gauche": [
+      30.9997,
+      1.9446
+    ],
+    "Obstacle en hauteur très proche au centre": [
+      33.1444,
+      2.0501
+    ],
+    "Obstacle en hauteur très proche à droite": [
+      35.3944,
+      2.0405
+    ],
+    "Obstacle très proche à gauche": [
+      37.6349,
+      1.4648
+    ],
+    "Obstacle très proche au centre": [
+      39.2997,
+      1.5804
+    ],
+    "Obstacle très proche à droite": [
+      41.0801,
+      1.5627
+    ],
+    "Dénivelé très proche à gauche": [
+      42.8428,
+      1.3962
+    ],
+    "Dénivelé très proche au centre": [
+      44.439,
+      1.5174
+    ],
+    "Dénivelé très proche à droite": [
+      46.1564,
+      1.4922
+    ]
+  }
+}

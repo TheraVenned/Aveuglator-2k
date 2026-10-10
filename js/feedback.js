@@ -1,6 +1,21 @@
-// Retours à l'utilisateur : sons (Web Audio), vibrations et annonces vocales.
+// Retours à l'utilisateur : sons, annonces vocales et vibrations.
+//
+// Tout le son passe par Web Audio, y compris la voix (phrases préenregistrées, voir
+// tools/build-voice.mjs). La synthèse vocale du navigateur n'est volontairement pas utilisée :
+// sur iPhone, Safari met en pause la vidéo de la caméra dès qu'un site appelle speechSynthesis.
 
 import { Band, Level, alertMessage } from './analyzer.js';
+
+/** Annonces système. Chaque phrase doit exister dans audio/voice.json. */
+export const PHRASES = Object.freeze({
+  active: 'Détection active.',
+  stopped: 'Détection arrêtée.',
+  stalled: "Attention, la caméra ne fournit plus d'images. Détection suspendue.",
+  restored: 'Détection rétablie.',
+  slow: 'Performances dégradées, la détection est ralentie.',
+  error: 'Erreur. La détection est arrêtée.',
+  cameraDenied: 'Accès à la caméra refusé.',
+});
 
 // Espacement des impulsions : assez large pour qu'on puisse les compter à l'oreille.
 const TAP_SPACING = 0.12;
@@ -89,10 +104,19 @@ class AudioOutput {
     this.context = null;
     this.master = null;
     this.active = new Set();
+    /** Phrases préenregistrées : { buffer, clips: { phrase: [début, durée] } }. */
+    this.voice = null;
+    this.voiceLoading = null;
+    this.voiceSource = null;
+    this.voiceEndTime = 0;
   }
 
   get isRunning() {
     return this.context !== null && this.context.state === 'running';
+  }
+
+  get isSpeaking() {
+    return this.context !== null && this.context.currentTime < this.voiceEndTime;
   }
 
   /** À appeler dans un geste de l'utilisateur : les navigateurs bloquent le son sinon. */
@@ -117,6 +141,57 @@ class AudioOutput {
 
   setVolume(volume) {
     if (this.master) this.master.gain.value = volume;
+  }
+
+  /** Charge les annonces vocales. Sans effet si elles le sont déjà ; renvoie `false` en cas d'échec. */
+  loadVoice(indexUrl, audioUrl) {
+    if (!this.context) return Promise.resolve(false);
+    if (!this.voiceLoading) {
+      this.voiceLoading = (async () => {
+        const [indexResponse, audioResponse] = await Promise.all([fetch(indexUrl), fetch(audioUrl)]);
+        if (!indexResponse.ok || !audioResponse.ok) throw new Error('Annonces vocales introuvables.');
+        const index = await indexResponse.json();
+        const buffer = await this.context.decodeAudioData(await audioResponse.arrayBuffer());
+        this.voice = { buffer, clips: index.clips };
+        return true;
+      })().catch((error) => {
+        console.warn('Annonces vocales indisponibles.', error);
+        this.voiceLoading = null;
+        return false;
+      });
+    }
+    return this.voiceLoading;
+  }
+
+  /** Joue une phrase préenregistrée. Renvoie `false` si elle est inconnue ou le son indisponible. */
+  say(text) {
+    const clip = this.voice && this.voice.clips[text];
+    if (!clip || !this.isRunning) return false;
+    this.stopVoice();
+    const source = this.context.createBufferSource();
+    source.buffer = this.voice.buffer;
+    source.connect(this.master);
+    const at = this.context.currentTime + 0.02;
+    source.start(at, clip[0], clip[1]);
+    source.onended = () => {
+      source.disconnect();
+      if (this.voiceSource === source) this.voiceSource = null;
+    };
+    this.voiceSource = source;
+    this.voiceEndTime = at + clip[1];
+    return true;
+  }
+
+  stopVoice() {
+    if (this.voiceSource) {
+      try {
+        this.voiceSource.stop();
+      } catch {
+        // Déjà arrêtée.
+      }
+    }
+    this.voiceSource = null;
+    this.voiceEndTime = 0;
   }
 
   play(pattern) {
@@ -181,16 +256,20 @@ class AudioOutput {
  * ensuite. Elle est tentée au cas où, sans effet de bord si elle ne fait rien.
  */
 function iosTick() {
-  const label = document.createElement('label');
-  label.setAttribute('aria-hidden', 'true');
-  label.style.display = 'none';
-  const input = document.createElement('input');
-  input.type = 'checkbox';
-  input.setAttribute('switch', '');
-  label.appendChild(input);
-  document.head.appendChild(label);
-  label.click();
-  document.head.removeChild(label);
+  try {
+    const label = document.createElement('label');
+    label.setAttribute('aria-hidden', 'true');
+    label.style.display = 'none';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.setAttribute('switch', '');
+    label.appendChild(input);
+    document.head.appendChild(label);
+    label.click();
+    document.head.removeChild(label);
+  } catch {
+    // Sans importance : ce retour est un bonus.
+  }
 }
 
 /**
@@ -219,6 +298,11 @@ export class FeedbackEngine {
     return typeof navigator.vibrate === 'function';
   }
 
+  /** Vrai une fois les annonces vocales chargées. */
+  get hasVoice() {
+    return this.audio.voice !== null;
+  }
+
   configure(settings) {
     Object.assign(this.settings, settings);
     this.audio.setVolume(this.settings.volume);
@@ -228,6 +312,10 @@ export class FeedbackEngine {
   unlock() {
     this.audio.unlock();
     this.audio.setVolume(this.settings.volume);
+  }
+
+  loadVoice(indexUrl, audioUrl) {
+    return this.audio.loadVoice(indexUrl, audioUrl);
   }
 
   start() {
@@ -271,31 +359,20 @@ export class FeedbackEngine {
   /**
    * Annonce vocale. `urgent` interrompt l'annonce en cours et ignore le délai minimal ; `force`
    * passe outre le réglage « Annonces vocales » (pannes : la détection n'est plus assurée).
+   * Renvoie `false` si l'annonce a été écartée.
    */
   speak(text, { urgent = false, force = false, minimumInterval = 2.5 } = {}) {
-    if (!('speechSynthesis' in window)) return false;
     if (!force && !this.settings.voice) return false;
     const now = performance.now() / 1000;
     if (!urgent && now - this.lastSpeechTime < minimumInterval) return false;
-    const interrupts = window.speechSynthesis.speaking || window.speechSynthesis.pending;
-    if (interrupts && !urgent) return false;
+    if (this.audio.isSpeaking && !urgent) return false;
+    if (!this.audio.say(text)) return false;
     this.lastSpeechTime = now;
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = 'fr-FR';
-    utterance.rate = 1.1;
-    utterance.volume = this.settings.volume;
-    if (interrupts) {
-      // Safari ignore une annonce lancée dans la foulée d'une annulation : on laisse un court délai.
-      window.speechSynthesis.cancel();
-      setTimeout(() => window.speechSynthesis.speak(utterance), 80);
-    } else {
-      window.speechSynthesis.speak(utterance);
-    }
     return true;
   }
 
   tick() {
-    // Retente une annonce écartée (trop rapprochée de la précédente, synthèse occupée).
+    // Retente une annonce écartée (trop rapprochée de la précédente, voix encore occupée).
     this.announce(this.currentAlert);
     const now = performance.now() / 1000;
     if (now < this.nextFireTime) return;
