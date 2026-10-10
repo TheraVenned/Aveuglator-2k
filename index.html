@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0a1024">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Aveuglator">
+  <title>Aveuglator 2000</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <main id="app">
+    <!-- Vidéo et superpositions de diagnostic : purement visuelles, masquées aux lecteurs d'écran. -->
+    <div id="stage" aria-hidden="true">
+      <video id="camera" playsinline muted autoplay></video>
+      <div id="overlay">
+        <canvas id="heatmap" width="256" height="256"></canvas>
+        <div id="grid"></div>
+      </div>
+    </div>
+
+    <section id="hud">
+      <p id="status" role="status" aria-live="polite">Détection arrêtée</p>
+      <p id="warning" role="alert" hidden></p>
+
+      <dl id="diagnostics" hidden>
+        <div><dt>FPS réels</dt><dd id="d-fps">0</dd></div>
+        <div><dt>Inférence</dt><dd id="d-inference">0 ms</dd></div>
+        <div><dt>Traitement total</dt><dd id="d-total">0 ms</dd></div>
+        <div><dt>Profondeur brute</dt><dd id="d-raw">0 à 0</dd></div>
+        <div><dt>Moteur</dt><dd id="d-backend">non chargé</dd></div>
+        <div><dt>Vibration</dt><dd id="d-vibration">inconnue</dd></div>
+      </dl>
+
+      <p id="intro">
+        Tenez le téléphone à la verticale, caméra vers l'avant, à hauteur de poitrine, puis
+        appuyez sur Démarrer. Montez le volume : les obstacles sont signalés par des sons.
+      </p>
+
+      <div class="spacer"></div>
+
+      <p id="alert" hidden>Voie dégagée</p>
+      <div id="sectors" aria-hidden="true" hidden>
+        <span id="band-symbol">✓</span>
+        <span class="sector" data-sector="0">G</span>
+        <span class="sector" data-sector="1">C</span>
+        <span class="sector" data-sector="2">D</span>
+      </div>
+
+      <button id="toggle" class="primary" type="button">Démarrer la détection</button>
+      <div class="row">
+        <button id="diagnostic-toggle" class="secondary" type="button" aria-pressed="true">Diagnostic activé</button>
+        <button id="settings-open" class="secondary" type="button">Réglages</button>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="settings" aria-labelledby="settings-title">
+    <form method="dialog">
+      <h2 id="settings-title">Réglages</h2>
+
+      <fieldset>
+        <legend>Retours</legend>
+        <label class="switch"><span>Sons</span><input type="checkbox" data-setting="sound"></label>
+        <label class="switch"><span>Annonces vocales</span><input type="checkbox" data-setting="voice"></label>
+        <label class="switch"><span>Vibrations</span><input type="checkbox" data-setting="vibration"></label>
+        <p id="vibration-note" class="note"></p>
+        <label class="slider"><span>Volume <output data-output="volume"></output></span>
+          <input type="range" min="0" max="1" step="0.05" data-setting="volume"></label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Détection</legend>
+        <label class="select"><span>Caméra</span>
+          <select data-setting="cameraId"><option value="">Automatique</option></select></label>
+        <label class="slider"><span>Sensibilité <output data-output="sensitivity"></output></span>
+          <input type="range" min="0.5" max="1.5" step="0.05" data-setting="sensitivity"></label>
+        <label class="slider"><span>Référence proche <output data-output="nearReference"></output></span>
+          <input type="range" min="0" max="3000" step="50" data-setting="nearReference"></label>
+        <p class="note">
+          Référence proche : valeur brute du modèle tenue pour « très proche ». À 0, la profondeur
+          est normalisée image par image. Relevez « Profondeur brute » en mode diagnostic face à
+          un obstacle à environ un mètre pour la calibrer.
+        </p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Diagnostic</legend>
+        <label class="switch"><span>Mode diagnostic</span><input type="checkbox" data-setting="diagnostic"></label>
+        <label class="slider"><span>Opacité de la carte <output data-output="opacity"></output></span>
+          <input type="range" min="0" max="1" step="0.05" data-setting="opacity"></label>
+        <label class="switch"><span>Accélération WebGPU (expérimental)</span><input type="checkbox" data-setting="webgpu"></label>
+        <p class="note">
+          WebGPU peut accélérer nettement l'analyse sur les téléphones récents. La page se
+          recharge au changement ; en cas d'échec, le moteur standard reprend la main.
+        </p>
+      </fieldset>
+
+      <button class="primary" type="submit">Fermer</button>
+    </form>
+  </dialog>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

@@ -1,2 +1,5 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Fins de ligne LF dans le dépôt, quel que soit le poste de travail.
+* text=auto eol=lf
+*.png binary
+*.onnx binary
+*.wasm binary

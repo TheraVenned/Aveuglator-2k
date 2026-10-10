@@ -1,0 +1,408 @@
+:root {
+  color-scheme: dark;
+  --background: #000;
+  --panel: rgba(22, 22, 26, 0.72);
+  --panel-border: rgba(255, 255, 255, 0.16);
+  --text: #fff;
+  --accent: #ffc400;
+  --level-0: #2ecc71;
+  --level-1: #ffd60a;
+  --level-2: #ff9500;
+  --level-3: #ff3b30;
+  --radius: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  background: var(--background);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-text-size-adjust: 100%;
+  overscroll-behavior: none;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+}
+
+/* --- Vidéo et superpositions -------------------------------------------------------------- */
+
+#stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+#camera {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #000;
+}
+
+/* Dimensionné en JavaScript pour épouser exactement l'image vidéo recadrée (object-fit: cover). */
+#overlay {
+  position: absolute;
+  display: none;
+  pointer-events: none;
+}
+
+body.diagnostic.running #overlay {
+  display: block;
+}
+
+#heatmap {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0.55;
+}
+
+#grid {
+  position: absolute;
+  inset: 0;
+}
+
+.zone {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+}
+
+/* Les secteurs latéraux débordent de l'écran : leur score est calé côté intérieur. */
+.zone[data-sector="0"] {
+  justify-content: flex-end;
+}
+
+.zone[data-sector="2"] {
+  justify-content: flex-start;
+}
+
+.zone[data-level="1"] {
+  background: rgba(255, 214, 10, 0.28);
+}
+
+.zone[data-level="2"] {
+  background: rgba(255, 149, 0, 0.28);
+}
+
+.zone[data-level="3"] {
+  background: rgba(255, 59, 48, 0.28);
+}
+
+.zone.primary {
+  border: 4px solid #fff;
+}
+
+.zone span {
+  margin: 6px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.55);
+  font: 600 11px ui-monospace, Menlo, Consolas, monospace;
+}
+
+/* --- Interface ---------------------------------------------------------------------------- */
+
+#hud {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: calc(12px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right))
+    calc(12px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left));
+}
+
+#hud > p,
+#diagnostics {
+  margin: 0;
+}
+
+.spacer {
+  flex: 1;
+}
+
+#status,
+#intro,
+#diagnostics,
+#alert,
+.secondary {
+  border: 1px solid var(--panel-border);
+}
+
+#status {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--panel);
+  font-weight: 600;
+  text-align: center;
+}
+
+#warning {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--level-1);
+  color: #000;
+  font-weight: 600;
+}
+
+#intro {
+  padding: 14px;
+  border-radius: 12px;
+  background: var(--panel);
+  font-size: 1.1rem;
+  line-height: 1.4;
+}
+
+body.running #intro,
+body.starting #intro {
+  display: none;
+}
+
+#diagnostics {
+  display: grid;
+  gap: 3px;
+  padding: 10px;
+  border-radius: 12px;
+  background: var(--panel);
+  font: 500 12px ui-monospace, Menlo, Consolas, monospace;
+}
+
+/* Les mesures n'ont de sens que pendant la détection. */
+body:not(.running) #diagnostics {
+  display: none;
+}
+
+#diagnostics div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+#diagnostics dt,
+#diagnostics dd {
+  margin: 0;
+}
+
+#alert {
+  padding: 14px 12px;
+  border-radius: var(--radius);
+  background: var(--panel);
+  font-size: 1.4rem;
+  font-weight: 700;
+  text-align: center;
+}
+
+#alert[data-level="1"] {
+  background: var(--level-1);
+  color: #000;
+}
+
+#alert[data-level="2"] {
+  background: var(--level-2);
+  color: #000;
+}
+
+#alert[data-level="3"] {
+  background: var(--level-3);
+  color: #000;
+}
+
+#sectors {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+#band-symbol {
+  width: 40px;
+  font-size: 1.4rem;
+  font-weight: 700;
+  text-align: center;
+}
+
+.sector {
+  flex: 1;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.14);
+  font-weight: 700;
+  transition: transform 0.2s ease-out;
+}
+
+.sector.active {
+  color: #000;
+}
+
+.sector.active[data-level="1"] {
+  background: var(--level-1);
+}
+
+.sector.active[data-level="2"] {
+  background: var(--level-2);
+}
+
+.sector.active[data-level="3"] {
+  background: var(--level-3);
+}
+
+.sector.flash {
+  transform: scale(1.12);
+  transition-duration: 0.05s;
+}
+
+/* Les attributs `hidden` doivent l'emporter sur les `display` définis ci-dessus. */
+[hidden] {
+  display: none !important;
+}
+
+/* --- Boutons ------------------------------------------------------------------------------ */
+
+button {
+  font: inherit;
+  color: inherit;
+  border: 0;
+  border-radius: var(--radius);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.primary {
+  min-height: 64px;
+  width: 100%;
+  background: var(--level-0);
+  color: #000;
+  font-size: 1.4rem;
+  font-weight: 700;
+}
+
+body.running #toggle,
+body.starting #toggle {
+  background: var(--level-3);
+  color: #fff;
+}
+
+.row {
+  display: flex;
+  gap: 10px;
+}
+
+.secondary {
+  flex: 1;
+  min-height: 48px;
+  background: var(--panel);
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+/* --- Réglages ----------------------------------------------------------------------------- */
+
+dialog {
+  width: min(92vw, 460px);
+  max-height: 88vh;
+  padding: 0;
+  border: 0;
+  border-radius: 18px;
+  background: #1c1c1e;
+  color: var(--text);
+}
+
+dialog::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+
+dialog form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+}
+
+dialog h2 {
+  margin: 0;
+  font-size: 1.3rem;
+}
+
+fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 12px;
+}
+
+legend {
+  padding: 0 6px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.switch,
+.select {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 36px;
+}
+
+.switch input {
+  width: 26px;
+  height: 26px;
+  accent-color: var(--accent);
+}
+
+.slider {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.slider input {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+select {
+  max-width: 60%;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font: inherit;
+}
+
+.note {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.35;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.note:empty {
+  display: none;
+}
