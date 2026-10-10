@@ -3,7 +3,7 @@
 
 import { ObstacleAnalyzer, BANDS, SECTORS, Level, zoneIndex, zoneRect, alertMessage } from './analyzer.js';
 import { MODEL_SIZE } from './depth.js';
-import { renderDepth } from './heatmap.js';
+import { DepthRenderer, coverScale } from './renderer.js';
 import { FeedbackEngine, PHRASES } from './feedback.js';
 import { Camera, CANCELLED } from './camera.js';
 import { EngineError, enginePlan, createEngine } from './inference.js';
@@ -12,12 +12,11 @@ const SERVICE_WORKER_URL = new URL('../sw.js', import.meta.url).href;
 const VOICE_INDEX_URL = new URL('../audio/voice.json', import.meta.url).href;
 const VOICE_AUDIO_URL = new URL('../audio/voice.wav', import.meta.url).href;
 
-const SETTINGS_KEY = 'aveuglator.settings.v2';
+const SETTINGS_KEY = 'aveuglator.settings.v3';
 const RELOAD_FLAG = 'aveuglator.isolation-reload';
 const SINGLE_THREAD_FLAG = 'aveuglator.single-thread';
 const DEFAULT_SETTINGS = {
-  hud: true,
-  palette: 'shadow',
+  hud: false,
   sound: true,
   voice: true,
   vibration: true,
@@ -36,52 +35,35 @@ const CAMERA_RESTART_AFTER_MS = 1200;
 const CAMERA_ALERT_AFTER_MS = 3000;
 const CAMERA_RESTART_INTERVAL_MS = 2500;
 const CAMERA_RESTART_LIMIT = 4;
-const BAND_NAMES = ['Tête', 'Corps', 'Sol'];
-const STATUS_LABELS = { stopped: 'Arrêt', starting: 'Démarrage', running: 'Actif', failed: 'Erreur' };
+/** Attente maximale du service worker, à la première visite, avant de démarrer sans lui. */
+const ISOLATION_WAIT_MS = 4000;
 
 const byId = (id) => document.getElementById(id);
 const elements = {
-  stage: byId('stage'),
-  viewport: byId('viewport'),
+  view: byId('view'),
   video: byId('camera'),
   depth: byId('depth'),
   grid: byId('grid'),
-  idle: byId('idle'),
-  statusText: byId('status-text'),
-  warning: byId('warning'),
-  readout: byId('readout'),
-  matrix: byId('matrix'),
+  metrics: byId('metrics'),
+  message: byId('message'),
+  soundHint: byId('sound-hint'),
+  bar: byId('bar'),
+  dot: byId('dot'),
   alert: byId('alert'),
-  systemLine: byId('system-line'),
-  toggle: byId('toggle'),
-  hudToggle: byId('hud-toggle'),
   settingsOpen: byId('settings-open'),
   settings: byId('settings'),
   vibrationNote: byId('vibration-note'),
-  fps: byId('d-fps'),
-  inference: byId('d-inference'),
-  total: byId('d-total'),
-  raw: byId('d-raw'),
-  cameraInfo: byId('d-camera'),
-  spark: byId('spark'),
 };
-
-const IDLE_TEXT = elements.idle.textContent;
 
 const settings = loadSettings();
 const analyzer = new ObstacleAnalyzer();
 const feedback = new FeedbackEngine();
 const camera = new Camera(elements.video, MODEL_SIZE);
-const depthContext = elements.depth.getContext('2d');
-const depthImage = depthContext.createImageData(MODEL_SIZE, MODEL_SIZE);
-const sparkContext = elements.spark.getContext('2d');
+const renderer = new DepthRenderer(elements.depth);
 const zoneCells = buildGrid();
-const matrixCells = buildMatrix();
 
 const state = {
   phase: 'stopped', // 'stopped' | 'starting' | 'running' | 'failed'
-  // Intention de l'utilisateur : sert à reprendre la détection au retour au premier plan.
-  shouldRun: false,
   // Incrémenté à chaque démarrage ou arrêt : invalide les boucles et chargements en cours.
   run: 0,
   // Moteur d'inférence en service, et plan de repli dont il est issu (voir inference.js).
@@ -89,16 +71,16 @@ const state = {
   enginePromise: null,
   plan: [],
   planIndex: 0,
-  engineNote: '',
   wakeLock: null,
+  // L'annonce « Détection active » attend que le son soit autorisé par un geste.
+  greeted: false,
   // Mesures.
   frameTimes: [],
-  rateHistory: [],
   inferenceAverage: 0,
   totalAverage: 0,
   lowRateSince: null,
   lowRate: false,
-  lastTelemetryAt: 0,
+  lastMetricsAt: 0,
   // Surveillance de la caméra.
   cameraIssueSince: null,
   cameraRestarts: 0,
@@ -149,25 +131,17 @@ function settingInput(key) {
 function bindSettingsForm() {
   for (const input of elements.settings.querySelectorAll('[data-setting]')) {
     const key = input.dataset.setting;
-    writeInput(input, settings[key]);
+    if (input.type === 'checkbox') input.checked = Boolean(settings[key]);
+    else input.value = String(settings[key]);
     input.addEventListener('input', () => {
-      settings[key] = readInput(input);
+      if (input.type === 'checkbox') settings[key] = input.checked;
+      else if (input.type === 'range') settings[key] = Number(input.value);
+      else settings[key] = input.value;
       saveSettings();
       settingChanged(key);
     });
   }
   refreshOutputs();
-}
-
-function readInput(input) {
-  if (input.type === 'checkbox') return input.checked;
-  if (input.type === 'range') return Number(input.value);
-  return input.value;
-}
-
-function writeInput(input, value) {
-  if (input.type === 'checkbox') input.checked = Boolean(value);
-  else input.value = String(value);
 }
 
 function refreshOutputs() {
@@ -190,10 +164,6 @@ function settingChanged(key) {
 
 function applySettings() {
   document.body.classList.toggle('hud', settings.hud);
-  elements.hudToggle.textContent = settings.hud ? 'Mesures affichées' : 'Mesures masquées';
-  elements.hudToggle.setAttribute('aria-pressed', String(settings.hud));
-  const hudInput = settingInput('hud');
-  if (hudInput) hudInput.checked = settings.hud;
   feedback.configure({
     sound: settings.sound,
     voice: settings.voice,
@@ -208,41 +178,17 @@ function isActive() {
   return state.phase === 'starting' || state.phase === 'running';
 }
 
-function setPhase(phase) {
+/** `message` : texte affiché à la place de la vision (vide pendant la détection). */
+function setPhase(phase, message = '') {
   state.phase = phase;
-  for (const name of Object.keys(STATUS_LABELS)) {
+  for (const name of ['stopped', 'starting', 'running', 'failed']) {
     document.body.classList.toggle(name, name === phase);
   }
-  elements.statusText.textContent = STATUS_LABELS[phase];
-  elements.toggle.textContent = isActive() ? 'Arrêter la détection' : 'Démarrer la détection';
-  refreshWarning();
+  elements.message.textContent = message;
 }
 
-/** Texte affiché à la place de la vision tant que la détection ne tourne pas. */
-function setIdle(text) {
-  elements.idle.textContent = text;
-}
-
-function setStartupStatus(run, text) {
-  if (run === state.run && state.phase === 'starting') setIdle(text);
-}
-
-function refreshWarning(errorText = '') {
-  let text = errorText;
-  if (state.phase === 'running') {
-    if (state.stalled) text = 'Aucune image reçue : la détection est suspendue.';
-    else if (state.lowRate) text = "Cadence d'analyse faible : réactivité dégradée.";
-    else if (state.engineNote) text = state.engineNote;
-  }
-  elements.warning.textContent = text;
-  elements.warning.hidden = text === '';
-}
-
-function refreshSystemLine() {
-  const engine = state.engine ? state.engine.label : 'moteur non chargé';
-  const vibration = feedback.canVibrate ? 'vibration prête' : 'vibration indisponible';
-  const voice = feedback.hasVoice ? 'voix prête' : 'voix non chargée';
-  elements.systemLine.textContent = `${engine} · ${vibration} · ${voice}`;
+function setStartupMessage(run, text) {
+  if (run === state.run && state.phase === 'starting') elements.message.textContent = text;
 }
 
 function buildGrid() {
@@ -252,6 +198,7 @@ function buildGrid() {
       const rect = zoneRect(analyzer.config, band, sector);
       const cell = document.createElement('div');
       cell.className = 'zone';
+      cell.dataset.sector = String(sector);
       cell.style.left = `${rect.x * 100}%`;
       cell.style.top = `${rect.y * 100}%`;
       cell.style.width = `${rect.width * 100}%`;
@@ -261,46 +208,27 @@ function buildGrid() {
       elements.grid.appendChild(cell);
       cells[zoneIndex(band, sector)] = { cell, label };
     }
-    // Nom de la bande, le long du bord gauche.
-    const rows = zoneRect(analyzer.config, band, SECTORS[0]);
-    const tag = document.createElement('em');
-    tag.className = 'band-tag';
-    tag.textContent = BAND_NAMES[band];
-    tag.style.top = `${(rows.y + rows.height / 2) * 100}%`;
-    elements.grid.appendChild(tag);
   }
   return cells;
 }
 
-function buildMatrix() {
-  const cells = [];
-  for (let index = 0; index < BANDS.length * SECTORS.length; index++) {
-    const cell = document.createElement('i');
-    cell.className = 'cell';
-    elements.matrix.appendChild(cell);
-    cells.push(cell);
-  }
-  return cells;
+function frameAspect() {
+  const { videoWidth, videoHeight } = elements.video;
+  return videoWidth && videoHeight ? videoWidth / videoHeight : 3 / 4;
 }
 
-/**
- * Donne à la vision les proportions de l'image analysée, à la plus grande taille qui tienne :
- * tout le champ de la caméra est visible, y compris les secteurs latéraux.
- */
-function layoutViewport() {
-  const { stage, viewport, video } = elements;
-  const maxWidth = stage.clientWidth;
-  const maxHeight = stage.clientHeight;
-  if (!maxWidth || !maxHeight) return;
-  const aspect = video.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : 3 / 4;
-  let width = maxWidth;
-  let height = width / aspect;
-  if (height > maxHeight) {
-    height = maxHeight;
-    width = height * aspect;
-  }
-  viewport.style.width = `${Math.floor(width)}px`;
-  viewport.style.height = `${Math.floor(height)}px`;
+/** Cale la grille des zones sur l'image telle qu'elle est recadrée à l'écran. */
+function layout() {
+  const width = elements.view.clientWidth;
+  const height = elements.view.clientHeight;
+  if (!width || !height) return;
+  const [scaleX, scaleY] = coverScale(frameAspect(), width / height);
+  const gridWidth = width / scaleX;
+  const gridHeight = height / scaleY;
+  elements.grid.style.width = `${gridWidth}px`;
+  elements.grid.style.height = `${gridHeight}px`;
+  elements.grid.style.left = `${(width - gridWidth) / 2}px`;
+  elements.grid.style.top = `${(height - gridHeight) / 2}px`;
 }
 
 function showAlert(alert) {
@@ -308,106 +236,51 @@ function showAlert(alert) {
   if (key === state.shownAlert) return;
   state.shownAlert = key;
   elements.alert.textContent = alert ? alertMessage(alert) : 'Voie dégagée';
-  const level = String(alert ? alert.level : Level.NONE);
-  elements.readout.dataset.level = level;
-  elements.viewport.dataset.level = level;
+  elements.bar.dataset.level = String(alert ? alert.level : Level.NONE);
+}
+
+/** Le point de la barre réagit à chaque motif réellement joué (son ou vibration). */
+function pulseDot() {
+  elements.dot.classList.add('pulse');
+  setTimeout(() => elements.dot.classList.remove('pulse'), 110);
 }
 
 /**
- * Annonce d'état (démarrage, arrêt, panne). Attend au besoin la fin du chargement des annonces :
- * une panne survenue dès le démarrage doit tout de même être dite.
+ * Annonce d'état (démarrage, panne). Attend au besoin la fin du chargement des annonces : une
+ * panne survenue dès le démarrage doit tout de même être dite.
  */
 function announce(phrase, force = false) {
   feedback.loadVoice(VOICE_INDEX_URL, VOICE_AUDIO_URL).then(() => {
-    refreshSystemLine();
     feedback.speak(phrase, { urgent: true, force });
   });
 }
 
-/** Fait réagir la matrice à chaque motif réellement joué (son ou vibration). */
-function pulseMatrix(alert) {
-  const cell = matrixCells[zoneIndex(alert.band, alert.sector)];
-  cell.classList.add('pulse');
-  setTimeout(() => cell.classList.remove('pulse'), 110);
-}
-
 function render(depth, result, now) {
-  renderDepth(depth.values, depthImage.data, settings.palette);
-  depthContext.putImageData(depthImage, 0, 0);
-
+  renderer.draw(depth.values, depth.width, depth.height, camera.guide, frameAspect());
   showAlert(result.primaryAlert);
-  const primary = result.primaryAlert;
-  for (const band of BANDS) {
-    for (const sector of SECTORS) {
-      const index = zoneIndex(band, sector);
-      const reading = result.zones[index];
-      const isPrimary = primary !== null && primary.band === band && primary.sector === sector;
-      const level = String(reading.level);
-      matrixCells[index].dataset.level = level;
-      matrixCells[index].classList.toggle('is-primary', isPrimary);
-      if (settings.hud) {
-        const { cell, label } = zoneCells[index];
-        cell.dataset.level = level;
-        cell.classList.toggle('is-primary', isPrimary);
-        label.textContent = reading.score.toFixed(2);
-      }
-    }
+  if (!settings.hud) return;
+
+  for (let index = 0; index < result.zones.length; index++) {
+    const reading = result.zones[index];
+    const { cell, label } = zoneCells[index];
+    cell.dataset.level = String(reading.level);
+    label.textContent = reading.score.toFixed(2);
   }
-
   // Les chiffres sont rafraîchis quatre fois par seconde pour rester lisibles.
-  if (!settings.hud || now - state.lastTelemetryAt < 250) return;
-  state.lastTelemetryAt = now;
-  const rate = currentFrameRate(now);
-  elements.fps.textContent = rate.toFixed(1);
-  elements.inference.textContent = state.inferenceAverage.toFixed(0);
-  elements.total.textContent = state.totalAverage.toFixed(0);
-  elements.raw.textContent = `${depth.rawMin.toFixed(0)}–${depth.rawMax.toFixed(0)}`;
+  if (now - state.lastMetricsAt < 250) return;
+  state.lastMetricsAt = now;
   const restarts = state.cameraRestarts > 0 ? ` · relances ${state.cameraRestarts}` : '';
-  elements.cameraInfo.textContent = `${camera.description}${restarts}`;
-  drawSparkline(rate);
-}
-
-/** Courbe des dernières cadences mesurées (une quinzaine de secondes). */
-function drawSparkline(rate) {
-  const history = state.rateHistory;
-  history.push(rate);
-  if (history.length > 60) history.shift();
-  const { width, height } = elements.spark;
-  const top = Math.max(10, ...history);
-  sparkContext.clearRect(0, 0, width, height);
-  sparkContext.beginPath();
-  history.forEach((value, index) => {
-    const x = (index / 59) * width;
-    const y = height - 2 - (value / top) * (height - 4);
-    if (index === 0) sparkContext.moveTo(x, y);
-    else sparkContext.lineTo(x, y);
-  });
-  sparkContext.strokeStyle = '#ffc400';
-  sparkContext.lineWidth = 3;
-  sparkContext.lineJoin = 'round';
-  sparkContext.stroke();
-}
-
-/** Vision opaque et noire : la vidéo de la caméra, placée dessous, ne doit jamais apparaître. */
-function blankDepth() {
-  depthContext.fillStyle = '#0a0d14';
-  depthContext.fillRect(0, 0, MODEL_SIZE, MODEL_SIZE);
+  elements.metrics.textContent = [
+    `${currentFrameRate(now).toFixed(1)} fps · ${state.inferenceAverage.toFixed(0)} ms · ${state.engine.label}`,
+    `prof ${depth.rawMin.toFixed(0)}–${depth.rawMax.toFixed(0)}`,
+    `${camera.description}${restarts}`,
+  ].join('\n');
 }
 
 function clearDisplay() {
-  blankDepth();
-  for (const { cell, label } of zoneCells) {
-    cell.dataset.level = '0';
-    cell.classList.remove('is-primary');
-    label.textContent = '';
-  }
-  for (const cell of matrixCells) {
-    cell.dataset.level = '0';
-    cell.classList.remove('is-primary');
-  }
+  renderer.clear();
   state.shownAlert = undefined;
-  elements.readout.dataset.level = '0';
-  elements.viewport.dataset.level = '0';
+  elements.bar.dataset.level = '0';
 }
 
 // --- Mesures -------------------------------------------------------------------------------------
@@ -435,19 +308,17 @@ function recordFrame(started, finished, inferenceMs) {
   const lowRate = state.lowRateSince !== null && finished - state.lowRateSince > 3000;
   if (lowRate !== state.lowRate) {
     state.lowRate = lowRate;
-    refreshWarning();
     if (lowRate) announce(PHRASES.slow, true);
   }
 }
 
 function resetMeasures() {
   state.frameTimes = [];
-  state.rateHistory = [];
   state.inferenceAverage = 0;
   state.totalAverage = 0;
   state.lowRateSince = null;
   state.lowRate = false;
-  state.lastTelemetryAt = 0;
+  state.lastMetricsAt = 0;
   state.cameraIssueSince = null;
   state.cameraRestarts = 0;
   state.lastRestartAt = 0;
@@ -461,7 +332,11 @@ function resetMeasures() {
  * figer le flux sans prévenir : on relance alors la lecture, puis on rouvre la caméra. La personne
  * n'est avertie que si cela ne suffit pas, car elle ne voit pas l'écran.
  */
-async function superviseCamera() {
+async function supervise() {
+  // Les navigateurs n'autorisent le son qu'après un geste : on le rappelle tant qu'il manque.
+  elements.soundHint.hidden = !isActive() || feedback.audio.isRunning;
+  greet();
+
   if (state.phase !== 'running' || state.restartingCamera) return;
   camera.probe();
   const now = performance.now();
@@ -471,8 +346,8 @@ async function superviseCamera() {
     state.cameraIssueSince = null;
     if (state.stalled) {
       state.stalled = false;
+      elements.message.textContent = '';
       announce(PHRASES.restored, true);
-      refreshWarning();
     }
     return;
   }
@@ -483,16 +358,16 @@ async function superviseCamera() {
 
   if (elapsed >= CAMERA_ALERT_AFTER_MS && !state.stalled) {
     state.stalled = true;
+    elements.message.textContent = 'La caméra ne fournit plus d’images.';
     feedback.update(null);
     feedback.notify('fault');
     announce(PHRASES.stalled, true);
-    refreshWarning();
   }
 
   const shouldRestart = health === 'ended' || elapsed >= CAMERA_RESTART_AFTER_MS;
   if (shouldRestart && now - state.lastRestartAt >= CAMERA_RESTART_INTERVAL_MS) {
     if (state.cameraRestarts >= CAMERA_RESTART_LIMIT) {
-      fail('la caméra ne répond plus.');
+      fail('La caméra ne répond plus.');
       return;
     }
     state.cameraRestarts += 1;
@@ -507,7 +382,8 @@ async function restartCamera() {
   state.lastRestartAt = performance.now();
   try {
     await camera.start(settings.cameraId, () => run !== state.run);
-    layoutViewport();
+    renderer.reset();
+    layout();
     refreshCameraList();
   } catch (error) {
     // Nouvelle tentative au prochain passage de la surveillance, dans la limite prévue.
@@ -553,20 +429,18 @@ function ensureEngine(run) {
 
 /** Initialise le premier moteur du plan qui fonctionne, à partir de `fromIndex`. */
 async function startEngine(fromIndex, run) {
-  let lastError = new Error('aucun moteur de calcul disponible.');
+  let lastError = new Error('Aucun moteur de calcul disponible.');
   for (let index = fromIndex; index < state.plan.length; index++) {
     const step = state.plan[index];
     const engine = createEngine(step);
     try {
       await engine.init((stage, fraction) => {
-        const text = stage === 'download'
-          ? `Téléchargement du modèle… ${Math.round(fraction * 100)} %`
-          : `Préparation du modèle (${engine.label})…`;
-        setStartupStatus(run, text);
+        setStartupMessage(run, stage === 'download'
+          ? `Téléchargement du modèle ${Math.round(fraction * 100)} %`
+          : 'Préparation du modèle');
       });
       state.engine = engine;
       state.planIndex = index;
-      refreshSystemLine();
       return engine;
     } catch (error) {
       console.warn(`Moteur ${engine.label} indisponible.`, error);
@@ -597,8 +471,6 @@ async function replaceEngine(run, error) {
   rememberEngineFailure(state.plan[state.planIndex]);
   if (state.engine) state.engine.dispose();
   state.engine = null;
-  state.engineNote = 'Moteur de calcul relancé en mode compatible.';
-  refreshWarning();
   try {
     await startEngine(state.planIndex + 1, run);
   } catch (startError) {
@@ -610,17 +482,12 @@ async function replaceEngine(run, error) {
 
 // --- Cycle de vie --------------------------------------------------------------------------------
 
+/** Lance la détection. Appelée d'elle-même au chargement et au retour au premier plan. */
 async function start() {
   if (isActive()) return;
-  // À faire tout de suite, dans le geste de l'utilisateur : déverrouille le son.
-  feedback.unlock();
-  // Les annonces se chargent pendant le démarrage, pour être prêtes dès la première alerte.
-  feedback.loadVoice(VOICE_INDEX_URL, VOICE_AUDIO_URL).then(refreshSystemLine);
-
-  state.shouldRun = true;
   const run = ++state.run;
-  setPhase('starting');
-  setIdle('Démarrage de la détection…');
+  setPhase('starting', 'Démarrage');
+  elements.alert.textContent = 'Démarrage';
   clearDisplay();
 
   try {
@@ -633,24 +500,22 @@ async function start() {
 
   analyzer.reset();
   resetMeasures();
-  state.engineNote = '';
-  layoutViewport();
+  layout();
   refreshCameraList();
-  refreshSystemLine();
   setPhase('running');
   showAlert(null);
   feedback.start();
-  feedback.notify('started');
-  announce(PHRASES.active);
+  greet();
   acquireWakeLock();
   processFrames(run);
 }
 
-/** Arrêt demandé par l'utilisateur. */
-function stop() {
-  state.shouldRun = false;
-  halt();
-  announce(PHRASES.stopped);
+/** Signale le démarrage, dès que le son est disponible. */
+function greet() {
+  if (state.greeted || state.phase !== 'running' || !feedback.audio.isRunning) return;
+  state.greeted = true;
+  feedback.notify('started');
+  announce(PHRASES.active);
 }
 
 function halt() {
@@ -660,9 +525,8 @@ function halt() {
   releaseWakeLock();
   resetMeasures();
   clearDisplay();
-  setIdle(IDLE_TEXT);
+  state.greeted = false;
   setPhase('stopped');
-  elements.alert.textContent = 'Prêt';
 }
 
 function fail(message, error = null) {
@@ -672,10 +536,9 @@ function fail(message, error = null) {
   releaseWakeLock();
   resetMeasures();
   clearDisplay();
-  setIdle(IDLE_TEXT);
-  setPhase('failed');
+  state.greeted = false;
+  setPhase('failed', `${message}\n\nTouchez l’écran pour réessayer.`);
   elements.alert.textContent = 'Détection arrêtée';
-  refreshWarning(`Erreur : ${message}`);
   feedback.notify('fault');
   const denied = error !== null && (error.name === 'NotAllowedError' || error.name === 'SecurityError');
   announce(denied ? PHRASES.cameraDenied : PHRASES.error, true);
@@ -685,15 +548,15 @@ function describeError(error) {
   switch (error && error.name) {
     case 'NotAllowedError':
     case 'SecurityError':
-      return 'accès à la caméra refusé. Autorisez la caméra pour ce site dans les réglages du navigateur.';
+      return 'Accès à la caméra refusé. Autorisez la caméra pour ce site dans les réglages du navigateur.';
     case 'NotFoundError':
     case 'OverconstrainedError':
-      return 'aucune caméra utilisable sur cet appareil.';
+      return 'Aucune caméra utilisable sur cet appareil.';
     case 'NotReadableError':
     case 'AbortError':
-      return 'la caméra est déjà utilisée par une autre application.';
+      return 'La caméra est déjà utilisée par une autre application.';
     default:
-      return (error && error.message) || 'erreur inconnue.';
+      return (error && error.message) || 'Erreur inconnue.';
   }
 }
 
@@ -766,84 +629,80 @@ function releaseWakeLock() {
 // --- Service worker ------------------------------------------------------------------------------
 
 /**
- * Enregistre le service worker puis, à la première visite, recharge la page une fois : c'est lui
- * qui ajoute les en-têtes rendant la page « cross-origin isolated », nécessaires au calcul multi-fil.
+ * Enregistre le service worker. C'est lui qui ajoute les en-têtes rendant la page « cross-origin
+ * isolated », nécessaires au calcul multi-fil : à la première visite, la page doit donc être
+ * rechargée une fois. Renvoie `true` si ce rechargement est lancé (inutile alors de démarrer).
  */
-async function registerServiceWorker() {
-  if (!('serviceWorker' in navigator)) return;
+async function prepareIsolation() {
+  if (!('serviceWorker' in navigator)) return false;
   try {
     await navigator.serviceWorker.register(SERVICE_WORKER_URL);
   } catch (error) {
     console.warn('Service worker non enregistré : calcul sur un seul fil.', error);
-    return;
+    return false;
   }
   if (self.crossOriginIsolated) {
     sessionStorage.removeItem(RELOAD_FLAG);
-    return;
+    return false;
   }
   // Une seule tentative par session, pour ne jamais boucler si l'isolation reste impossible.
-  if (sessionStorage.getItem(RELOAD_FLAG)) return;
-  const reload = () => {
-    if (state.phase !== 'stopped') return;
-    sessionStorage.setItem(RELOAD_FLAG, '1');
-    location.reload();
-  };
-  if (navigator.serviceWorker.controller) reload();
-  else navigator.serviceWorker.addEventListener('controllerchange', reload, { once: true });
+  if (sessionStorage.getItem(RELOAD_FLAG)) return false;
+
+  if (!navigator.serviceWorker.controller) {
+    const controlled = await new Promise((resolve) => {
+      navigator.serviceWorker.addEventListener('controllerchange', () => resolve(true), { once: true });
+      setTimeout(() => resolve(false), ISOLATION_WAIT_MS);
+    });
+    if (!controlled) return false;
+  }
+  sessionStorage.setItem(RELOAD_FLAG, '1');
+  location.reload();
+  return true;
 }
 
 // --- Initialisation ------------------------------------------------------------------------------
 
-function init() {
+async function init() {
   bindSettingsForm();
   applySettings();
   clearDisplay();
-  setPhase('stopped');
-  refreshSystemLine();
-  layoutViewport();
+  setPhase('stopped', 'Démarrage');
 
   elements.vibrationNote.textContent = feedback.canVibrate
     ? ''
     : "Ce navigateur ne donne pas accès au moteur de vibration (c'est le cas de Safari sur iPhone) : les dangers sont signalés par le son et la voix.";
+  feedback.onPulse = pulseDot;
 
-  feedback.onPulse = pulseMatrix;
-
-  elements.toggle.addEventListener('click', () => {
-    if (isActive()) stop();
-    else start();
-  });
-  elements.hudToggle.addEventListener('click', () => {
-    settings.hud = !settings.hud;
-    saveSettings();
-    applySettings();
-  });
   elements.settingsOpen.addEventListener('click', () => elements.settings.showModal());
 
-  // Un geste quelconque suffit à réveiller le son si le navigateur l'a suspendu.
+  // Premier geste : autorise le son. Après une erreur, un appui relance la détection.
   document.addEventListener('pointerdown', () => {
-    if (isActive()) feedback.unlock();
+    feedback.unlock();
+    setTimeout(greet, 300);
+  });
+  elements.view.addEventListener('click', () => {
+    if (state.phase === 'failed') start();
   });
 
-  elements.video.addEventListener('loadedmetadata', layoutViewport);
-  elements.video.addEventListener('resize', layoutViewport);
+  elements.video.addEventListener('loadedmetadata', layout);
+  elements.video.addEventListener('resize', layout);
   // Mise en pause par le navigateur : on relance sans attendre la surveillance périodique.
   elements.video.addEventListener('pause', () => {
     if (state.phase === 'running') camera.resume();
   });
-  window.addEventListener('resize', layoutViewport);
-  if ('ResizeObserver' in window) new ResizeObserver(layoutViewport).observe(elements.stage);
+  window.addEventListener('resize', layout);
 
   // Le navigateur coupe la caméra en arrière-plan : on arrête proprement, puis on reprend.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       if (isActive()) halt();
-    } else if (state.shouldRun && !isActive()) {
+    } else if (!isActive()) {
       start();
     }
   });
 
-  setInterval(superviseCamera, 500);
-  registerServiceWorker();
+  setInterval(supervise, 500);
+  if (!(await prepareIsolation()) && !document.hidden) start();
 }
 
 init();

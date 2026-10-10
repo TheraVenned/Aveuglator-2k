@@ -20,9 +20,12 @@ Caméra arrière, objectif le plus large, format 4:3
   → signalement du danger prioritaire : sons, voix, vibrations
 ```
 
-L'écran montre uniquement **ce que voit le modèle** : la carte de profondeur, rendue en ombres
-(le lointain est blanc, ce qui est proche se détache en sombre). L'image de la caméra n'est
-jamais affichée.
+L'écran montre **ce que voit le modèle**, en plein cadre : la carte de profondeur, rendue en
+ombres (le lointain est clair, ce qui est proche se détache en sombre). Le modèle ne produit
+qu'une carte de 256 × 256 ; elle est affinée sur la carte graphique à l'aide de l'image de la
+caméra, qui sert de guide : les contours des objets redeviennent nets et le relief fin de la
+scène (textures, arêtes) est reporté sur la teinte de profondeur (`js/renderer.js`). L'image de
+la caméra elle-même n'est jamais affichée.
 
 | Bande | Ce qui est détecté | Critère |
 | --- | --- | --- |
@@ -87,8 +90,9 @@ double-clic ne fonctionne pas, les navigateurs exigeant un serveur pour la camé
 
 ## Utilisation
 
-1. Ouvrez l'adresse du site sur le téléphone (Safari sur iPhone, Chrome sur Android).
-2. Appuyez sur **Démarrer la détection** et autorisez la caméra.
+1. Ouvrez l'adresse du site sur le téléphone (Safari sur iPhone, Chrome sur Android) et
+   autorisez la caméra : la détection démarre seule.
+2. Touchez l'écran une fois : les navigateurs n'autorisent le son qu'après un geste.
 3. Tenez le téléphone **à la verticale, caméra vers l'avant, à hauteur de poitrine**, et montez
    le volume. Le découpage en bandes suppose cette position ; un téléphone incliné vers le bas
    fait remonter le sol dans la bande « corps ».
@@ -102,20 +106,20 @@ Pour le plein écran sur iPhone : bouton Partager de Safari → **Sur l'écran d
 
 ### Lire l'écran
 
-- **Vision** : la carte de profondeur, entière, découpée en 9 zones (bandes Tête, Corps, Sol ;
-  secteurs gauche, centre, droite). Le cadre prend la couleur du danger en cours.
-- **Mesures** (bouton « Mesures affichées ») : score de chaque zone, FPS réels et leur courbe,
-  temps d'inférence (INF) et de traitement total (TOT), étendue brute du modèle (PROF), caméra
-  en service et nombre de relances automatiques.
-- **Bandeau du bas** : danger prioritaire, matrice des 9 zones (elle réagit à chaque motif
-  joué), puis moteur de calcul, vibration et voix disponibles.
+- **Vision** : tout l'écran, sauf la barre du bas.
+- **Barre du bas** : le danger prioritaire, précédé d'un point à sa couleur qui réagit à chaque
+  motif joué, et l'accès aux réglages.
+- **Mesures** (Réglages → Afficher les mesures, masquées par défaut) : score des 9 zones, FPS
+  réels, temps d'inférence, moteur de calcul, étendue brute du modèle (prof), caméra en service
+  et nombre de relances automatiques.
+
+Après une erreur, un appui sur l'écran relance la détection.
 
 ### Réglages
 
 - **Sons, annonces vocales, vibrations, volume**.
 - **Caméra** : par défaut l'angle le plus large (objectif ultra grand-angle s'il existe, zoom au
   minimum, format 4:3 pour ne pas rogner les côtés). Une caméra précise peut être imposée.
-- **Rendu** : ombres (par défaut) ou fausses couleurs (rouge = proche, bleu = loin).
 - **Sensibilité** : multiplie les scores avant seuillage.
 - **Référence proche** : MiDaS ne donne qu'une profondeur relative, normalisée image par image.
   Une scène entièrement lointaine est donc étirée jusqu'au plus sombre. Pour l'éviter, relevez
@@ -148,7 +152,8 @@ js/inference-worker.js    Exécution de MiDaS hors de la page
 js/depth.js               Appel du modèle et normalisation de la profondeur
 js/analyzer.js            Découpage en zones et scores de danger
 js/feedback.js            Sons, annonces vocales, vibrations et leur cadence
-js/heatmap.js             Rendu de la carte (ombres, fausses couleurs)
+js/renderer.js            Rendu affiné de la vision du modèle (WebGL)
+js/heatmap.js             Rendu de secours, sans WebGL
 sw.js                     Cache hors connexion et calcul multi-fil
 models/                   MiDaS v2.1 Small au format ONNX
 vendor/ort/               Moteur d'inférence onnxruntime-web

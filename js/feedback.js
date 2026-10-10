@@ -404,6 +404,8 @@ export class FeedbackEngine {
   emit(pattern) {
     if (this.settings.sound) this.audio.play(pattern);
     if (!this.settings.vibration) return;
+    // Comme le son, la vibration n'est autorisée qu'après un premier geste sur la page.
+    if (navigator.userActivation && !navigator.userActivation.hasBeenActive) return;
     if (this.canVibrate) {
       navigator.vibrate(toVibrationSequence(pattern));
     } else {
@@ -414,7 +416,8 @@ export class FeedbackEngine {
 
   silence() {
     this.audio.silence();
-    if (this.canVibrate) navigator.vibrate(0);
+    const activated = !navigator.userActivation || navigator.userActivation.hasBeenActive;
+    if (this.canVibrate && activated) navigator.vibrate(0);
     for (const timer of this.tickTimers) clearTimeout(timer);
     this.tickTimers = [];
   }

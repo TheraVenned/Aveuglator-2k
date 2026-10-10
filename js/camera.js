@@ -100,6 +100,9 @@ export class Camera {
     probeCanvas.width = PROBE_SIZE;
     probeCanvas.height = PROBE_SIZE;
     this.probeContext = probeCanvas.getContext('2d', { willReadFrequently: true });
+    /** Dernière image capturée, en pleine définition. */
+    this.guide = document.createElement('canvas');
+    this.guideContext = this.guide.getContext('2d');
     this.stream = null;
     this.track = null;
     this.label = '';
@@ -181,6 +184,12 @@ export class Camera {
     if (!this.stream || video.readyState < 2 || video.videoWidth === 0) return null;
     this.context.drawImage(video, 0, 0, this.size, this.size);
     const pixels = this.context.getImageData(0, 0, this.size, this.size).data;
+    // La même image, en pleine définition : elle guidera l'affinage du rendu (voir renderer.js).
+    if (this.guide.width !== video.videoWidth || this.guide.height !== video.videoHeight) {
+      this.guide.width = video.videoWidth;
+      this.guide.height = video.videoHeight;
+    }
+    this.guideContext.drawImage(video, 0, 0);
 
     // Deux indices de nouveauté : l'horloge de la vidéo et le contenu de l'image. Un seul suffit,
     // aucun des deux n'étant fiable sur tous les navigateurs.
